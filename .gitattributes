@@ -1,0 +1,26 @@
+* text=auto
+
+# Windows batch files
+*.bat binary
+*.cmd binary
+
+# Source / docs
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.qss text eol=lf
+
+# Images / binaries
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.onnx binary
+*.safetensors binary
+*.gguf binary
+*.zip binary
+*.7z binary
+*.rar binary
