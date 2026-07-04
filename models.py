@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+# GIF は静止・アニメーションを問わず、表示とTaggerでは先頭フレームを静止画として扱う。
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 
 @dataclass

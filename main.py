@@ -4,6 +4,8 @@ from pathlib import Path
 from PySide6.QtCore import QLibraryInfo, QTranslator
 from PySide6.QtWidgets import QApplication
 
+from theme import enable_dark_color_scheme, install_windows_dark_title_bar_support
+
 from logger import (
     configure_logging,
     get_logger,
@@ -92,6 +94,15 @@ def main() -> int:
     log.info("log file: %s", log_file)
 
     app = QApplication(sys.argv)
+
+    # Windowsのシステムテーマがライトでも、Qt標準部品はプラットフォーム側の
+    # ダーク配色で描画させる。QPalette/Fusion/標準部品QSSは使わない。
+    if not enable_dark_color_scheme(app):
+        log.warning("Qt ColorScheme.Dark could not be enabled")
+
+    # 子ダイアログを含むQtトップレベルのDWMタイトルバーをダーク化する。
+    install_windows_dark_title_bar_support(app)
+
     _install_qt_japanese_translations(app, log)
 
     from app_window import AppWindow

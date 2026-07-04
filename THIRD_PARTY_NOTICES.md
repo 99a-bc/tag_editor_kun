@@ -38,3 +38,28 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Runtime-downloaded tagger models
+
+This project supports the following image tagger models. Their model weights and
+model-provided files are **not** bundled with this repository or its releases.
+They are obtained from their respective Hugging Face repositories into the end
+user's local cache.
+
+Use of each model is subject to the license and any access conditions shown by
+its source repository. This project does not grant rights to the model artifacts
+or to the underlying training data.
+
+### WD EVA02 Large Tagger v3
+
+- Model repository: `SmilingWolf/wd-eva02-large-tagger-v3`
+- Source: `https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3`
+- License listed by the model card: Apache License 2.0
+
+### PixAI Tagger v0.9
+
+- Model repository: `pixai-labs/pixai-tagger-v0.9`
+- Source: `https://huggingface.co/pixai-labs/pixai-tagger-v0.9`
+- License listed by the model card for the weights: Apache License 2.0
+- Access: The end user must review and accept any access conditions required by
+  the source repository before downloading the model files.

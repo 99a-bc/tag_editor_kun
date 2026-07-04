@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from tagger.pixai_backend import PIXAI_MODEL_REPO, pixai_model_is_cached
 from tagger.result import TagCandidate, TaggerResult
 from tag_color_dictionary import DEFAULT_UNKNOWN_CATEGORY, TagColorDictionary
 from dev_config import dev_log_enabled
@@ -29,8 +30,6 @@ from logger import get_logger
 
 
 log = get_logger(__name__)
-
-PIXAI_MODEL_REPO = "pixai-labs/pixai-tagger-v0.9"
 
 
 TAGGER_PANEL_QSS = """
@@ -207,16 +206,15 @@ class TaggerPanel(QWidget):
             "WD EVA02 Large Tagger v3",
             "SmilingWolf/wd-eva02-large-tagger-v3",
         )
-        self.model_combo.addItem(
-            "PixAI Tagger v0.9",
-            "pixai-labs/pixai-tagger-v0.9",
-        )
+        # PixAIは必須ファイルがHugging Faceキャッシュに揃っている時だけ選択肢へ出す。
+        # 判定はローカルキャッシュだけを参照し、ネットワーク接続やダウンロードは行わない。
+        if pixai_model_is_cached():
+            self.model_combo.addItem(
+                "PixAI Tagger v0.9",
+                PIXAI_MODEL_REPO,
+            )
         self.model_combo.setCurrentIndex(0)
-        self.model_combo.setToolTip(
-            "使用するTaggerモデルを選択します。\n"
-            "PixAI Tagger v0.9は、事前にHugging Faceのアクセス許可と"
-            "モデル取得が必要です。"
-        )
+        self.model_combo.setToolTip("使用するTaggerモデルを選択します。")
 
         self.device_combo = QComboBox()
         self.device_combo.addItem("Auto", "auto")

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import QEvent, QObject, QTimer, Qt
+from PySide6.QtWidgets import QWidget
+
 
 # ==============================
 # Gazou Dark Theme
@@ -895,6 +898,9 @@ def enable_windows_dark_title_bar(widget) -> None:
         import ctypes
         from ctypes import wintypes
 
+        # 子ダイアログもDWM設定の前にネイティブHWNDを確保する。
+        # これをしないと、show/exec後に作り直されたタイトルバーが白のまま残ることがある。
+        widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         hwnd = int(widget.winId())
         value = ctypes.c_int(1)
 
@@ -909,3 +915,60 @@ def enable_windows_dark_title_bar(widget) -> None:
                 break
     except Exception:
         pass
+# LIGHT_THEME_DARK_SCHEME_PATCH_V1
+def enable_dark_color_scheme(app) -> bool:
+    # Qt 6.8以降のプラットフォーム提供ダーク配色を有効化する。
+    # QPaletteの手書き上書き、Fusionへの切替、標準部品のQSS描画は使わない。
+    try:
+        set_color_scheme = getattr(app.styleHints(), "setColorScheme", None)
+        if set_color_scheme is None:
+            return False
+
+        set_color_scheme(Qt.ColorScheme.Dark)
+        return True
+    except Exception:
+        return False
+
+
+def schedule_windows_dark_title_bar(widget) -> None:
+    # Qtがshow()/exec()中にHWNDを作り直す場合があるため、即時設定に加え
+    # イベントループへ戻った直後にも数回だけ再適用する。
+    enable_windows_dark_title_bar(widget)
+
+    for delay_ms in (0, 50, 200):
+        QTimer.singleShot(
+            delay_ms,
+            lambda target=widget: enable_windows_dark_title_bar(target),
+        )
+
+
+class WindowsDarkTitleBarEventFilter(QObject):
+    # アプリが開く全てのQtトップレベルウィンドウへダークタイトルバーを適用する。
+
+    _WATCHED_EVENTS = {
+        QEvent.Type.Show,
+        QEvent.Type.WinIdChange,
+    }
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if (
+            event.type() in self._WATCHED_EVENTS
+            and isinstance(watched, QWidget)
+            and watched.isWindow()
+            and not (watched.windowFlags() & Qt.WindowType.Popup)
+        ):
+            schedule_windows_dark_title_bar(watched)
+
+        return super().eventFilter(watched, event)
+
+
+def install_windows_dark_title_bar_support(app) -> None:
+    # QApplicationへ一度だけイベントフィルタを登録する。
+    # QMessageBox / QInputDialog / PreferencesDialog / 非ネイティブQFileDialogなどをカバーする。
+    attribute_name = "_windows_dark_title_bar_event_filter"
+    if getattr(app, attribute_name, None) is not None:
+        return
+
+    event_filter = WindowsDarkTitleBarEventFilter(app)
+    app.installEventFilter(event_filter)
+    setattr(app, attribute_name, event_filter)

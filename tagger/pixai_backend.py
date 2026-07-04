@@ -16,7 +16,37 @@ PIXAI_MODEL_REPO = "pixai-labs/pixai-tagger-v0.9"
 PIXAI_WEIGHTS_FILENAME = "model_v0.9.pth"
 PIXAI_TAGS_FILENAME = "tags_v0.9_13k.json"
 PIXAI_CHAR_IP_MAP_FILENAME = "char_ip_map.json"
+PIXAI_MODEL_FILENAMES = (
+    PIXAI_WEIGHTS_FILENAME,
+    PIXAI_TAGS_FILENAME,
+    PIXAI_CHAR_IP_MAP_FILENAME,
+)
 PIXAI_BASE_ENCODER_REPO = "hf_hub:SmilingWolf/wd-eva02-large-tagger-v3"
+
+
+def pixai_model_is_cached() -> bool:
+    """PixAIの必須ファイルがHugging Faceキャッシュに揃っているかを返す。
+
+    ネットワーク接続やダウンロードは行わない。未導入時にもTagger画面を開けるよう、
+    状態確認に失敗した場合は未導入として扱う。
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:
+        return False
+
+    for filename in PIXAI_MODEL_FILENAMES:
+        try:
+            cached_path = try_to_load_from_cache(
+                repo_id=PIXAI_MODEL_REPO,
+                filename=filename,
+            )
+            if not isinstance(cached_path, str) or not Path(cached_path).is_file():
+                return False
+        except Exception:
+            return False
+
+    return True
 
 
 @dataclass(frozen=True)

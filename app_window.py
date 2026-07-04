@@ -686,6 +686,9 @@ class AppWindow(QMainWindow):
         if not self._confirm_discard_unsaved():
             return
 
+        # Windows標準のフォルダ選択を優先する。
+        # これはWindowsのシステムテーマで描画されるため、アプリ側のダーク配色・
+        # タイトルバー指定は適用されないが、操作性とエクスプローラー連携を優先する。
         folder_text = QFileDialog.getExistingDirectory(self, "画像フォルダを開く")
         if not folder_text:
             return
