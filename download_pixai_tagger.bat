@@ -6,31 +6,33 @@ pushd "%~dp0"
 set "EXIT_CODE=1"
 set "PY=%CD%\.venv\Scripts\python.exe"
 if not exist "%PY%" (
-  echo [ERROR] Python 仮想環境が見つかりません。
-  echo 先に install.bat を実行して .venv を作成してください。
+  echo [ERROR] Python virtual environment was not found.
+  echo Run install.bat first to create .venv.
   goto :end
 )
 
 echo.
 echo ============================================================
-echo PixAI Tagger v0.9 のモデルファイルをダウンロードします
+echo Downloading PixAI Tagger v0.9 model files
 echo ============================================================
-echo ダウンロード先: Hugging Face の共有キャッシュ
+echo Complete the PixAI Tagger model access approval on Hugging Face first.
+echo Enter an access-approved Read token for this download only.
+echo The token is not displayed or saved.
 echo.
 
-"%PY%" -c "from huggingface_hub import snapshot_download; repo='pixai-labs/pixai-tagger-v0.9'; path=snapshot_download(repo_id=repo, allow_patterns=['model_v0.9.pth','tags_v0.9_13k.json','char_ip_map.json']); print(path)"
+"%PY%" "%CD%\download_pixai_tagger_helper.py"
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" goto :end_error
 
 echo.
-echo [OK] ダウンロードが完了しました。
-echo 保存先は上に表示されたキャッシュのパスです。
+echo [OK] Download completed.
+echo Restart the app, then select PixAI Tagger in the Tagger tab.
 goto :end
 
 :end_error
 echo.
-echo [ERROR] ダウンロードに失敗しました。
-echo hf_login.bat を、PixAI Tagger へのアクセス許可があるアカウントで完了させてください。
+echo [ERROR] Download failed.
+echo Check model access approval, the Read token, and your network connection.
 
 :end
 popd

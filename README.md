@@ -50,12 +50,14 @@ NVIDIA GPUを使う場合は自分の環境に合うCUDA版を選択してくだ
 
 ### PixAI Tagger v0.9 を使う場合
 
-PixAI Taggerを使う場合だけ、追加で以下を実行してください
+PixAI Taggerを使う場合だけ、追加で以下を実行してください。
 
 1. Hugging FaceでPixAI Taggerモデルへのアクセス許可を取得
-2. `hf_login.bat` を実行し、アクセス許可済みアカウントのReadトークンを登録
-3. `download_pixai_tagger.bat` を実行してモデルファイルを取得
-4. アプリのTaggerタブで `PixAI Tagger v0.9` を選択
+2. Hugging FaceのSettings → Access Tokensで、`Read` 権限のトークンを作成
+3. `download_pixai_tagger.bat` を実行し、表示された入力欄へトークンを貼り付けてモデルファイルを取得
+4. アプリを再起動し、Taggerタブで `PixAI Tagger v0.9` を選択
+
+入力したトークンは、モデルファイルの取得時だけ使用し、保存されません。
 
 ## 基本的な使い方
 

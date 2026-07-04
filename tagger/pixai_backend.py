@@ -21,32 +21,43 @@ PIXAI_MODEL_FILENAMES = (
     PIXAI_TAGS_FILENAME,
     PIXAI_CHAR_IP_MAP_FILENAME,
 )
-PIXAI_BASE_ENCODER_REPO = "hf_hub:SmilingWolf/wd-eva02-large-tagger-v3"
+PIXAI_BASE_ENCODER_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
+PIXAI_BASE_ENCODER_CONFIG_FILENAME = "config.json"
+
+
+def _find_cached_hf_file(repo_id: str, filename: str) -> Path | None:
+    """Hugging Faceキャッシュ内の既取得ファイルを、通信せずに探す。"""
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_path = try_to_load_from_cache(repo_id=repo_id, filename=filename)
+    except Exception:
+        return None
+
+    if not isinstance(cached_path, str):
+        return None
+
+    path = Path(cached_path)
+    return path if path.is_file() else None
 
 
 def pixai_model_is_cached() -> bool:
-    """PixAIの必須ファイルがHugging Faceキャッシュに揃っているかを返す。
+    """PixAIの実行に必要なローカルキャッシュが揃っているかを返す。
 
-    ネットワーク接続やダウンロードは行わない。未導入時にもTagger画面を開けるよう、
-    状態確認に失敗した場合は未導入として扱う。
+    PixAIの3ファイルに加え、モデル構成を読む公開ベースエンコーダ設定を確認する。
+    ネットワーク接続・自動ダウンロード・保存済みトークンの参照は行わない。
     """
-    try:
-        from huggingface_hub import try_to_load_from_cache
-    except Exception:
-        return False
-
-    for filename in PIXAI_MODEL_FILENAMES:
-        try:
-            cached_path = try_to_load_from_cache(
-                repo_id=PIXAI_MODEL_REPO,
-                filename=filename,
-            )
-            if not isinstance(cached_path, str) or not Path(cached_path).is_file():
-                return False
-        except Exception:
-            return False
-
-    return True
+    required_files = [
+        (PIXAI_MODEL_REPO, filename)
+        for filename in PIXAI_MODEL_FILENAMES
+    ]
+    required_files.append(
+        (PIXAI_BASE_ENCODER_REPO, PIXAI_BASE_ENCODER_CONFIG_FILENAME)
+    )
+    return all(
+        _find_cached_hf_file(repo_id, filename) is not None
+        for repo_id, filename in required_files
+    )
 
 
 @dataclass(frozen=True)
@@ -95,7 +106,6 @@ class PixAITaggerBackend:
     def _load_runtime(self):
         try:
             import torch
-            from huggingface_hub import hf_hub_download
             from PIL import Image  # noqa: F401
             from timm import create_model
             import torchvision.transforms as transforms
@@ -109,7 +119,7 @@ class PixAITaggerBackend:
                 f"install.bat を再実行してください。\n{exc}"
             ) from exc
 
-        return torch, hf_hub_download, create_model, transforms
+        return torch, create_model, transforms
 
     def _resolve_device(self, torch) -> str:
         if self.requested_device == "gpu":
@@ -197,38 +207,38 @@ class PixAITaggerBackend:
             if isinstance(character, str) and isinstance(ips, list)
         }
 
-    def _download_model_files(self, hf_hub_download) -> tuple[Path, Path, Path]:
-        try:
-            weights_path = Path(
-                hf_hub_download(
-                    repo_id=self.model_repo,
-                    filename=PIXAI_WEIGHTS_FILENAME,
+    def _resolve_model_files_from_cache(self) -> tuple[Path, Path, Path, Path]:
+        """PixAI実行に必要な取得済みファイルだけをローカルキャッシュから返す。"""
+        resolved_paths: list[Path] = []
+        for filename in PIXAI_MODEL_FILENAMES:
+            path = _find_cached_hf_file(self.model_repo, filename)
+            if path is None:
+                raise RuntimeError(
+                    "PixAI Tagger v0.9のモデルファイルがローカルキャッシュにありません。\n"
+                    "モデルページでアクセス許可を済ませ、download_pixai_tagger.bat を実行してください。"
                 )
-            )
-            tags_path = Path(
-                hf_hub_download(
-                    repo_id=self.model_repo,
-                    filename=PIXAI_TAGS_FILENAME,
-                )
-            )
-            ip_map_path = Path(
-                hf_hub_download(
-                    repo_id=self.model_repo,
-                    filename=PIXAI_CHAR_IP_MAP_FILENAME,
-                )
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "PixAI Tagger v0.9のモデルファイルをHugging Faceキャッシュから取得できませんでした。\n"
-                "モデルページでアクセス許可を済ませたアカウントで、"
-                "先に hf_login.bat と download_pixai_tagger.bat を実行してください。\n"
-                f"{exc}"
-            ) from exc
+            resolved_paths.append(path)
 
-        return weights_path, tags_path, ip_map_path
+        base_config_path = _find_cached_hf_file(
+            PIXAI_BASE_ENCODER_REPO,
+            PIXAI_BASE_ENCODER_CONFIG_FILENAME,
+        )
+        if base_config_path is None:
+            raise RuntimeError(
+                "PixAI Taggerのベースエンコーダ設定がローカルキャッシュにありません。\n"
+                "download_pixai_tagger.bat を実行してください。"
+            )
+
+        return (*resolved_paths, base_config_path)
 
     @staticmethod
-    def _build_model(torch, create_model, *, num_tags: int):
+    def _build_model(
+        torch,
+        create_model,
+        *,
+        num_tags: int,
+        base_config_path: Path,
+    ):
         # 公式handler.pyと同じencoder + 分類head構成。
         class TaggingHead(torch.nn.Module):
             def __init__(self, input_dim: int, num_classes: int) -> None:
@@ -240,7 +250,11 @@ class PixAITaggerBackend:
             def forward(self, value):
                 return torch.nn.functional.sigmoid(self.head(value))
 
-        encoder = create_model(PIXAI_BASE_ENCODER_REPO, pretrained=False)
+        # Hugging Faceへの通信を伴う hf-hub: 指定は使わず、事前取得済みconfig.jsonだけを読む。
+        encoder = create_model(
+            f"local-dir:{base_config_path.parent.as_posix()}",
+            pretrained=False,
+        )
         encoder.reset_classifier(0)
 
         input_dim = int(getattr(encoder, "num_features", 0))
@@ -254,13 +268,13 @@ class PixAITaggerBackend:
 
     def load(self) -> None:
         perf_started = time.perf_counter() if dev_log_enabled("TAGGER_PERF") else 0.0
-        torch, hf_hub_download, create_model, transforms = self._load_runtime()
+        torch, create_model, transforms = self._load_runtime()
 
         self.device_name = self._resolve_device(torch)
         self.device = torch.device(self.device_name)
 
         files_started = time.perf_counter() if perf_started else 0.0
-        weights_path, tags_path, ip_map_path = self._download_model_files(hf_hub_download)
+        weights_path, tags_path, ip_map_path, base_config_path = self._resolve_model_files_from_cache()
         files_ms = (time.perf_counter() - files_started) * 1000 if files_started else 0.0
 
         metadata_started = time.perf_counter() if perf_started else 0.0
@@ -273,6 +287,7 @@ class PixAITaggerBackend:
             torch,
             create_model,
             num_tags=len(self.tag_rows),
+            base_config_path=base_config_path,
         )
 
         try:
@@ -343,7 +358,7 @@ class PixAITaggerBackend:
         if self.model is None or self.transform is None or self.device is None or not self.tag_rows:
             self.load()
 
-        torch, _, _, _ = self._load_runtime()
+        torch, _, _ = self._load_runtime()
         from PIL import Image
 
         preprocess_started = time.perf_counter() if perf_started else 0.0
