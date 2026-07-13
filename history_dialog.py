@@ -254,7 +254,10 @@ class OperationHistoryDialog(QDialog):
 
     def _show_detail(self, entry: TagHistoryEntry) -> None:
         dialog = HistoryDetailDialog(entry, self)
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _request_undo_latest(self) -> None:
         self.undo_latest_requested.emit()

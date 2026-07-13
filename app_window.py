@@ -18,6 +18,7 @@ from dev_config import dev_log_enabled
 from PySide6.QtCore import Qt, QFile, QTimer, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -169,12 +170,16 @@ def _sort_image_paths_like_explorer(paths: list[Path], folder: Path, *, recursiv
 class AppWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("タグエディタ君 v1.0.0")
+        self.setWindowTitle("タグエディタ君 v1.1.0")
         self.resize(1440, 900)
 
         self.folder: Path | None = None
         self.items: list[ImageItem] = []
         self.current_index: int = -1
+        # タグ編集後の再フィルタで現在画像が消えた場合だけ、
+        # 編集前の位置を基準に「次、なければ前」へフォーカスを移す。
+        # 明示的なフィルタ条件変更では従来どおり結果先頭へ移動する。
+        self._tag_change_focus_reference_index: int | None = None
         self._current_recursive_load: bool = False
         self._current_recursive_depth: int = DEFAULT_RECURSIVE_LOAD_DEPTH
         # 左側の操作対象タグ欄。ここへ入った時だけ操作対象プレビューを新規発動する。
@@ -264,6 +269,9 @@ class AppWindow(QMainWindow):
         self.tag_panel.hover_changed.connect(self._on_tag_panel_hover_changed)
         self.tag_panel.panel_hover_changed.connect(self._on_whole_tag_panel_hover_changed)
         self.tag_panel.tag_filter_changed.connect(self._on_tag_filter_changed)
+        self.tag_panel.single_target_override_changed.connect(
+            self._on_single_target_override_changed
+        )
         self.tagger_panel.run_requested.connect(self._run_tagger_stage1)
         self.tagger_panel.reset_requested.connect(self._reset_tagger_stage1)
         self.tagger_panel.apply_requested.connect(self._apply_tagger_stage1)
@@ -2266,6 +2274,14 @@ class AppWindow(QMainWindow):
                 (time.perf_counter() - perf_started) * 1000,
             )
 
+    def _on_single_target_override_changed(self, active: bool) -> None:
+        """単体編集中は、黄色チェック画像の一覧プレビューを表示しない。"""
+        if active:
+            self._checked_hover_preview_active = False
+            self._hover_preview_restore_timer.stop()
+
+        self._update_preview_placeholder_state()
+
     def _on_tag_panel_hover_changed(self, hovered: bool) -> None:
         if self._lightbox_active or self._tagger_tab_is_active():
             return
@@ -2277,6 +2293,12 @@ class AppWindow(QMainWindow):
 
         if hovered:
             self._hover_preview_restore_timer.stop()
+
+            if self.tag_panel.is_single_target_override_active():
+                self._checked_hover_preview_active = False
+                self.preview_panel.restore_current_image()
+                return
+
             self._checked_hover_preview_active = True
             self._update_preview_placeholder_state()
             return
@@ -2321,11 +2343,23 @@ class AppWindow(QMainWindow):
         else:
             self._schedule_hover_preview_restore()
 
+    def _tag_panel_modal_dialog_active(self) -> bool:
+        """TagPanelを親階層に持つモーダルダイアログが開いているか返す。"""
+        modal = QApplication.activeModalWidget()
+
+        while modal is not None:
+            if modal is self.tag_panel:
+                return True
+            modal = modal.parentWidget()
+
+        return False
+
     def _schedule_hover_preview_restore(self) -> None:
         if (
             self._tag_panel_hovered
             or self._whole_tag_panel_hovered
             or self._preview_panel_hovered
+            or self._tag_panel_modal_dialog_active()
         ):
             return
 
@@ -2335,6 +2369,14 @@ class AppWindow(QMainWindow):
 
     def _finish_hover_preview_if_outside(self) -> None:
         if self._lightbox_active:
+            return
+
+        if self._tag_panel_modal_dialog_active():
+            # 追加・編集・履歴などのTagPanel配下ダイアログを開くと、
+            # マウスは一時的にTagPanel外へ出た扱いになる。
+            # すでに発動中の操作対象プレビューは維持し、
+            # ダイアログが閉じた後に通常のホバー判定へ戻す。
+            self._hover_preview_restore_timer.start()
             return
 
         if (
@@ -2356,6 +2398,14 @@ class AppWindow(QMainWindow):
     def _update_preview_placeholder_state(self) -> None:
         # Taggerタブ中は編集用のチェック対象プレビューを出さない。
         if self._tagger_tab_is_active():
+            return
+
+        # 黄色チェックを保持した一時単体編集中は、表示と実際の操作対象を揃えるため、
+        # 左側タグ欄へホバーしてもチェック画像一覧を発動しない。
+        if self.tag_panel.is_single_target_override_active():
+            self._checked_hover_preview_active = False
+            self._hover_preview_restore_timer.stop()
+            self.preview_panel.restore_current_image()
             return
 
         checked_items = self._checked_items()
@@ -2463,7 +2513,13 @@ class AppWindow(QMainWindow):
             self.thumbnail_panel.ensure_index_visible(self.current_index)
 
     def _select_first_visible_if_current_hidden(self) -> None:
-        """現在画像が表示対象から外れた時、表示結果の先頭へ現在選択を移す。"""
+        """
+        現在画像が表示対象から外れた時、表示中画像へ現在選択を移す。
+
+        明示的なフィルタ条件変更では従来どおり結果先頭へ移動する。
+        タグ編集後の再フィルタでは、編集前の位置より後ろで最初に残る画像を優先し、
+        後ろに残っていなければ手前で最後に残る画像へ移動する。
+        """
         if not self.items:
             return
 
@@ -2475,7 +2531,23 @@ class AppWindow(QMainWindow):
 
         visible_indexes = self.thumbnail_panel.visible_indexes()
         if visible_indexes:
-            self.select_image(visible_indexes[0])
+            target_index = visible_indexes[0]
+            reference_index = self._tag_change_focus_reference_index
+
+            if reference_index is not None and 0 <= reference_index < len(self.items):
+                later_indexes = [
+                    index for index in visible_indexes if index > reference_index
+                ]
+                earlier_indexes = [
+                    index for index in visible_indexes if index < reference_index
+                ]
+
+                if later_indexes:
+                    target_index = later_indexes[0]
+                elif earlier_indexes:
+                    target_index = earlier_indexes[-1]
+
+            self.select_image(target_index)
             return
 
         log.info("no visible images after filter")
@@ -2486,8 +2558,17 @@ class AppWindow(QMainWindow):
 
     def _on_tags_changed(self) -> None:
         include_tags, exclude_tags = self.tag_panel.current_tag_filters()
-        self.thumbnail_panel.set_tag_filters(include_tags, exclude_tags)
-        self._sync_current_image_after_tag_filter_change()
+
+        # タグ変更によって現在画像がフィルタ外へ落ちる場合は、
+        # 編集前の位置を基準に次の表示画像、なければ前の表示画像へ移す。
+        # set_tag_filters() 内の visible_view_changed は同期的に届くため、
+        # 最後の同期処理まで参照indexを保持して既存の先頭移動と区別する。
+        self._tag_change_focus_reference_index = self.current_index
+        try:
+            self.thumbnail_panel.set_tag_filters(include_tags, exclude_tags)
+            self._sync_current_image_after_tag_filter_change()
+        finally:
+            self._tag_change_focus_reference_index = None
 
     def _has_unsaved_changes(self) -> bool:
         return any(item.dirty for item in self.items)

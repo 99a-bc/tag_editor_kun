@@ -1143,6 +1143,11 @@ class AddTagDialog(QDialog):
 
         super().accept()
 
+    def done(self, result: int) -> None:
+        """ダイアログを閉じる前に、補完UIの全体イベント監視を解除する。"""
+        self._tag_completion.dispose()
+        super().done(result)
+
     def _unique_preview_tags(self) -> list[str]:
         tags: list[str] = []
         seen: set[str] = set()
@@ -1490,6 +1495,12 @@ class EditTagDialog(QDialog):
         if replacements is None:
             return
         super().accept()
+
+    def done(self, result: int) -> None:
+        """ダイアログを閉じる前に、各入力欄の補完UI監視をすべて解除する。"""
+        for controller in self._tag_completion_controllers:
+            controller.dispose()
+        super().done(result)
 
     def _build_replacements(self, *, validate: bool) -> dict[str, str | None] | None:
         replacements: dict[str, str | None] = {}
@@ -2809,11 +2820,16 @@ class TagPanel(QFrame):
     # 左右を含むタグパネル全体への出入り。発動済みプレビューの維持に使う。
     panel_hover_changed = Signal(bool)
     tag_filter_changed = Signal(object, object)
+    # 黄色チェックを維持したまま、左側だけ現在の青枠1枚を操作対象にする状態。
+    single_target_override_changed = Signal(bool)
 
     def __init__(self) -> None:
         super().__init__()
         self.items: list[ImageItem] = []
         self.current_index: int = -1
+        # 黄色チェック群を保持したまま、左側タグ欄だけ現在の青枠1枚へ切り替える。
+        # フォルダ切替・アプリ再起動では保持しない。
+        self._single_target_override_active: bool = False
         self._current_tag_buttons: dict[str, TagChip] = {}
         # チェック中画像の左側タグ欄では、チェック変更のたびに数百個のTagChipを
         # 作り直すと重いため、タグ名ごとにチップを再利用する。
@@ -2950,6 +2966,70 @@ class TagPanel(QFrame):
 
         self.target_label = QLabel("操作対象：表示中の1枚")
         self.target_label.setStyleSheet(TARGET_LABEL_QSS)
+
+        self.single_target_toggle_button = QPushButton("対象切替")
+        self.single_target_toggle_button.setToolTip(
+            "黄色チェックを維持したまま、左側タグ欄の操作対象だけを現在の青枠画像へ切り替えます"
+        )
+        self.single_target_toggle_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Fixed,
+        )
+        # 操作対象ラベルと同じ行へコンパクトに置き、
+        # ボタン出現時も下のタグパネルを押し下げない高さに固定する。
+        self.single_target_toggle_button.setObjectName(
+            "SingleTargetToggleButton"
+        )
+        self.single_target_toggle_button.setFixedSize(72, 24)
+        self.single_target_toggle_button.setProperty(
+            "singleTargetActive",
+            False,
+        )
+        self.single_target_toggle_button.setStyleSheet(
+            """
+            QPushButton#SingleTargetToggleButton {
+                color: #e8e8e8;
+                background: #242424;
+                border: 1px solid #555555;
+                border-radius: 6px;
+                padding: 1px 8px;
+            }
+            QPushButton#SingleTargetToggleButton:hover {
+                background: #303030;
+                border-color: #777777;
+            }
+            QPushButton#SingleTargetToggleButton:pressed {
+                background: #1d1d1d;
+            }
+            QPushButton#SingleTargetToggleButton:disabled {
+                color: #777777;
+                background: #1b1b1b;
+                border-color: #3a3a3a;
+            }
+            QPushButton#SingleTargetToggleButton[singleTargetActive="true"] {
+                color: #211800;
+                background: #e5b93f;
+                border: 1px solid #ffd866;
+                font-weight: bold;
+            }
+            QPushButton#SingleTargetToggleButton[singleTargetActive="true"]:hover {
+                background: #f0c94f;
+                border-color: #ffe58a;
+            }
+            QPushButton#SingleTargetToggleButton[singleTargetActive="true"]:pressed {
+                background: #c99d2f;
+            }
+            """
+        )
+        # ボタンは常時表示し、黄色チェックがない時だけ無効化する。
+        # 出現/消失させず位置を固定し、既存UIの「条件未成立時は無効」へ揃える。
+        self.single_target_toggle_button.setEnabled(False)
+        self.single_target_toggle_button.setToolTip(
+            "黄色チェックがある時に、左側タグ欄の操作対象を切り替えられます"
+        )
+        self.single_target_toggle_button.clicked.connect(
+            self._toggle_single_target_override
+        )
 
         self.current_tags_label = QLabel("選択中画像のタグ")
         self.current_tags_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3302,7 +3382,32 @@ class TagPanel(QFrame):
         # 右下のタグ数表示も、タグ形式ページの下端へ寄せる。
         tag_format_layout.setContentsMargins(8, 8, 8, 0)
         tag_format_layout.setSpacing(8)
-        tag_format_layout.addWidget(self.target_label)
+
+        # 操作対象行も下の左右タグパネルと同じ2列比率にする。
+        # 左列内ではラベルを左、切替ボタンを右へ置くことで、
+        # 文言の長さに関係なくボタン右端を左側緑見出しの右端へ揃える。
+        target_row_layout = QHBoxLayout()
+        target_row_layout.setContentsMargins(0, 0, 0, 0)
+        target_row_layout.setSpacing(lists_layout.spacing())
+
+        target_left_widget = QWidget()
+        target_left_layout = QHBoxLayout(target_left_widget)
+        target_left_layout.setContentsMargins(0, 0, 0, 0)
+        target_left_layout.setSpacing(8)
+        target_left_layout.addWidget(self.target_label)
+        target_left_layout.addStretch(1)
+        target_left_layout.addWidget(self.single_target_toggle_button)
+
+        target_right_spacer = QWidget()
+        target_right_spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        target_row_layout.addWidget(target_left_widget, 1)
+        target_row_layout.addWidget(target_right_spacer, 1)
+
+        tag_format_layout.addLayout(target_row_layout)
         tag_format_layout.addLayout(lists_layout, 1)
 
         self.format_tabs.addTab(self.tag_format_page, "タグ形式")
@@ -3838,6 +3943,11 @@ class TagPanel(QFrame):
         for tag in candidate_tags:
             chip = self._all_tag_rows.get(tag)
             if chip is None:
+                # フィルタ等で現在の右側一覧から外れていても、AllTagChip自体は
+                # キャッシュに残っている。非表示中に検索語を変更・クリアした場合も
+                # 古い検索ハイライトを解除できるよう、キャッシュ側も確認する。
+                chip = self._all_tag_chip_cache.get(tag)
+            if chip is None:
                 missing_tags += 1
                 continue
 
@@ -4174,6 +4284,9 @@ class TagPanel(QFrame):
             perf_started = time.perf_counter()
 
         self.items = items
+        single_target_override_was_active = self._single_target_override_active
+        self._single_target_override_active = False
+
         # 操作履歴は読み込んでいるフォルダに対してだけ有効。
         # 新しいフォルダを読み込んだ場合は、過去フォルダの履歴を破棄する。
         self._tag_history.clear()
@@ -4268,6 +4381,9 @@ class TagPanel(QFrame):
         self.refresh_target_label()
         self._refresh_active_filter_panel()
 
+        if single_target_override_was_active:
+            self.single_target_override_changed.emit(False)
+
         if perf_enabled:
             label_and_filter_ui_ms = (time.perf_counter() - label_started) * 1000
             emit_started = time.perf_counter()
@@ -4320,7 +4436,11 @@ class TagPanel(QFrame):
             and self._current_tags_view_mode == "checked"
             and self._current_tags_checked_count == checked_count
         )
-        deferred_current_tags_refresh = checked_count > 0 and defer_checked_refresh
+        deferred_current_tags_refresh = (
+            checked_count > 0
+            and defer_checked_refresh
+            and not self._single_target_override_active
+        )
 
         refresh_ms = 0.0
         if deferred_current_tags_refresh:
@@ -4376,12 +4496,95 @@ class TagPanel(QFrame):
                 (time.perf_counter() - perf_started) * 1000,
             )
 
+    def is_single_target_override_active(self) -> bool:
+        """黄色チェックを保持した一時単体編集モードが有効か返す。"""
+        return (
+            self._single_target_override_active
+            and any(item.checked for item in self.items)
+        )
+
+    def _toggle_single_target_override(self) -> None:
+        """左側タグ欄の操作対象を、チェック群と現在の青枠1枚で切り替える。"""
+        checked_count = sum(1 for item in self.items if item.checked)
+        if checked_count <= 0:
+            self._single_target_override_active = False
+            self.refresh_target_label()
+            return
+
+        self._single_target_override_active = (
+            not self._single_target_override_active
+        )
+        self.refresh_current_tags(reason="single_target_override")
+        self.refresh_target_label()
+        self.single_target_override_changed.emit(
+            self._single_target_override_active
+        )
+
+    def _set_single_target_toggle_button_active(
+        self,
+        active: bool,
+    ) -> None:
+        """単体編集モードの有効色を切替ボタンへ反映する。"""
+        if not hasattr(self, "single_target_toggle_button"):
+            return
+
+        button = self.single_target_toggle_button
+        active = bool(active)
+
+        if bool(button.property("singleTargetActive")) == active:
+            return
+
+        button.setProperty("singleTargetActive", active)
+        style = button.style()
+        style.unpolish(button)
+        style.polish(button)
+        button.update()
+
     def refresh_target_label(self) -> None:
-        checked_count = len([item for item in self.items if item.checked])
+        checked_count = sum(1 for item in self.items if item.checked)
+        override_deactivated = False
+
+        if checked_count <= 0 and self._single_target_override_active:
+            self._single_target_override_active = False
+            override_deactivated = True
+
+        self.single_target_toggle_button.setEnabled(
+            checked_count > 0
+        )
+
         if checked_count > 0:
-            self.target_label.setText(f"操作対象：チェック中画像 {checked_count}件")
+            if self._single_target_override_active:
+                self.target_label.setText(
+                    f"操作対象：表示中の1枚（チェック{checked_count}件保持中）"
+                )
+                self.single_target_toggle_button.setText("戻す")
+                self.single_target_toggle_button.setToolTip(
+                    "左側タグ欄の操作対象を、保持中の黄色チェック画像へ戻します"
+                )
+            else:
+                self.target_label.setText(
+                    f"操作対象：チェック中画像 {checked_count}件"
+                )
+                self.single_target_toggle_button.setText(
+                    "対象切替"
+                )
+                self.single_target_toggle_button.setToolTip(
+                    "黄色チェックを維持したまま、左側タグ欄の操作対象だけを現在の青枠画像へ切り替えます"
+                )
         else:
             self.target_label.setText("操作対象：表示中の1枚")
+            self.single_target_toggle_button.setText("対象切替")
+            self.single_target_toggle_button.setToolTip(
+                "黄色チェックがある時に、左側タグ欄の操作対象を切り替えられます"
+            )
+
+        self._set_single_target_toggle_button_active(
+            checked_count > 0
+            and self._single_target_override_active
+        )
+
+        if override_deactivated:
+            self.single_target_override_changed.emit(False)
 
     def _set_current_tag_count_label(self, count: int) -> None:
         """左側パネルに現在表示しているタグチップ数を表示する。"""
@@ -4430,6 +4633,11 @@ class TagPanel(QFrame):
         return len(tags)
 
     def _target_indexes(self) -> list[int]:
+        if self._single_target_override_active:
+            if 0 <= self.current_index < len(self.items):
+                return [self.current_index]
+            return []
+
         checked = [i for i, item in enumerate(self.items) if item.checked]
         if checked:
             return checked
@@ -4447,10 +4655,17 @@ class TagPanel(QFrame):
         checked_scan_started = time.perf_counter() if perf_enabled else 0.0
         checked_items = [item for item in self.items if item.checked]
         checked_scan_ms = (time.perf_counter() - checked_scan_started) * 1000 if perf_enabled else 0.0
+        use_checked_targets = (
+            bool(checked_items)
+            and not self._single_target_override_active
+        )
 
         tag_entries: list[tuple[str, str | None, str]] = []
-        self._current_tag_sort_enabled = bool(checked_items)
-        self._current_tag_reorder_enabled = not checked_items and 0 <= self.current_index < len(self.items)
+        self._current_tag_sort_enabled = use_checked_targets
+        self._current_tag_reorder_enabled = (
+            not use_checked_targets
+            and 0 <= self.current_index < len(self.items)
+        )
 
         counter_ms = 0.0
         sort_ms = 0.0
@@ -4469,7 +4684,7 @@ class TagPanel(QFrame):
         new_chips = 0
         reused_chips = 0
 
-        if checked_items:
+        if use_checked_targets:
             self._current_tags_view_mode = "checked"
             self.current_tags_label.setText("チェック中画像に含まれるタグ")
             counter = Counter()
@@ -4603,7 +4818,7 @@ class TagPanel(QFrame):
 
         set_chips_started = time.perf_counter() if perf_enabled else 0.0
         self._set_current_tag_count_label(len(chips))
-        if checked_items:
+        if use_checked_targets:
             # チェック中画像のタグ欄は大量タグになりやすいので、軽量Flow表示へ切り替える。
             self.current_area.set_tag_reorder_enabled(False)
             self.current_area.hide()
@@ -5536,7 +5751,10 @@ class TagPanel(QFrame):
         """操作履歴ダイアログを開く。"""
         dialog = OperationHistoryDialog(self._tag_history, self)
         dialog.undo_latest_requested.connect(self.undo_latest_tag_history_entry)
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _latest_undoable_history_entry(self) -> TagHistoryEntry | None:
         """まだ取り消されていない最新の通常タグ編集操作を返す。"""
@@ -5981,16 +6199,19 @@ class TagPanel(QFrame):
             tag_completion_enabled=self._tag_completion_enabled,
             tag_completion_limit=self._tag_completion_limit,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return [], None
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return [], None
 
-        tags = self._unique_tags(dialog.tags())
-        front_tag = dialog.front_tag()
+            tags = self._unique_tags(dialog.tags())
+            front_tag = dialog.front_tag()
 
-        if front_tag not in tags:
-            front_tag = None
+            if front_tag not in tags:
+                front_tag = None
 
-        return tags, front_tag
+            return tags, front_tag
+        finally:
+            dialog.deleteLater()
 
     def _confirm_global_action(self, message: str) -> bool:
         result = QMessageBox.question(
@@ -6623,9 +6844,12 @@ class TagPanel(QFrame):
             tag_completion_enabled=self._tag_completion_enabled,
             tag_completion_limit=self._tag_completion_limit,
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return {}
-        return dialog.replacements()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return {}
+            return dialog.replacements()
+        finally:
+            dialog.deleteLater()
 
     def _tag_presence_counts(self, indexes: list[int], selected_tags: list[str]) -> tuple[Counter[str], int]:
         counts: Counter[str] = Counter()

@@ -545,6 +545,7 @@ class TagCompletionController(QObject):
         self._dictionary = tag_dictionary
         self._limit = max(1, limit)
         self._applying_candidate = False
+        self._disposed = False
         self._popup_host_frame_geometry: QRect | None = None
 
         # 入力中の補完更新を少し遅らせ、連続入力での候補作り直しをまとめる。
@@ -580,6 +581,46 @@ class TagCompletionController(QObject):
 
         self._line_edit.textChanged.connect(self._schedule_refresh)
 
+    def dispose(self) -> None:
+        """
+        補完UIが登録したタイマー・シグナル・イベントフィルタを明示的に解除する。
+
+        タグ追加/編集ダイアログは起動中に何度も生成されるため、閉じたダイアログの
+        ControllerがQApplicationのイベントフィルタとして残らないようにする。
+        """
+        if self._disposed:
+            return
+
+        self._disposed = True
+        self._refresh_timer.stop()
+        self._popup_host_watch_timer.stop()
+        self._popup_host_frame_geometry = None
+
+        try:
+            self._popup.hide()
+        except RuntimeError:
+            pass
+
+        application = QApplication.instance()
+        for watched in (self._line_edit, self._host_window, application):
+            if watched is None:
+                continue
+            try:
+                watched.removeEventFilter(self)
+            except RuntimeError:
+                # 親ダイアログの破棄と競合した場合でも後始末を継続する。
+                pass
+
+        try:
+            self._line_edit.textChanged.disconnect(self._schedule_refresh)
+        except (RuntimeError, TypeError):
+            pass
+
+        try:
+            self._popup.candidate_chosen.disconnect(self._apply_candidate)
+        except (RuntimeError, TypeError):
+            pass
+
     def is_available(self) -> bool:
         return self._dictionary is not None and self._dictionary.is_available()
 
@@ -611,6 +652,9 @@ class TagCompletionController(QObject):
 
     def hide_popup(self) -> None:
         """保留中の候補更新・親位置監視を止めて、候補を閉じる。"""
+        if self._disposed:
+            return
+
         self._refresh_timer.stop()
         self._popup_host_watch_timer.stop()
         self._popup_host_frame_geometry = None
@@ -623,6 +667,9 @@ class TagCompletionController(QObject):
 
     def _hide_if_host_window_moved_or_resized(self) -> None:
         """親ダイアログが移動・リサイズされたら、候補を閉じる。"""
+        if self._disposed:
+            return
+
         if not self._popup.isVisible():
             self._popup_host_watch_timer.stop()
             return
@@ -635,6 +682,9 @@ class TagCompletionController(QObject):
             self.hide_popup()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if self._disposed:
+            return False
+
         event_type = event.type()
 
         # ToolTip型の候補ポップアップは親ウインドウに追従しないため、
@@ -716,11 +766,17 @@ class TagCompletionController(QObject):
         return super().eventFilter(watched, event)
 
     def _schedule_refresh(self, _text: str) -> None:
+        if self._disposed:
+            return
+
         if self._applying_candidate:
             return
         self._refresh_timer.start()
 
     def _refresh(self) -> None:
+        if self._disposed:
+            return
+
         # 入力欄から離れた操作中に、古いtextChangedタイマーで候補が
         # 再表示されないようにする。
         if not self._line_edit.hasFocus():
@@ -789,6 +845,9 @@ class TagCompletionController(QObject):
         self.hide_popup()
 
     def _hide_if_focus_left(self) -> None:
+        if self._disposed:
+            return
+
         focus_widget = QApplication.focusWidget()
         if (
             focus_widget is self._line_edit
