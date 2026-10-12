@@ -2,19 +2,22 @@ from __future__ import annotations
 
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from bisect import bisect_left, bisect_right
 import time
 
-from PySide6.QtCore import QPoint, Qt, QSize, Signal, QTimer, QItemSelectionModel
+from PySide6.QtCore import QPoint, QRect, Qt, QSize, Signal, QTimer, QItemSelectionModel
 from PySide6.QtGui import QColor, QIcon, QImage, QImageReader, QPainter, QPen, QPixmap
 
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMenu,
     QListWidgetItem,
@@ -33,7 +36,7 @@ from PySide6.QtWidgets import (
 
 from models import ImageItem
 from settings import DEFAULT_THUMBNAIL_WHEEL_SCROLL_PX, normalize_recursive_load_depth, normalize_thumbnail_wheel_scroll_px
-from theme import THUMBNAIL_FOOTER_QSS
+from theme import THUMBNAIL_FOOTER_QSS, TAG_SEARCH_BAR_QSS
 
 from logger import get_logger
 from dev_config import dev_log_enabled
@@ -129,6 +132,37 @@ TAGGER_STATUS_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 # サムネイル欄が現在どちらの操作文脈を表示しているか。
 # "edit" は既存の黄色チェック、"tagger" はTagger専用対象選択を表す。
 SELECTION_CONTEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 3
+# サムネイル内のファイル名検索で、ハイライトする元文字列位置。
+FILENAME_SEARCH_SPAN_ROLE = int(Qt.ItemDataRole.UserRole) + 4
+
+
+def _filename_match_span(filename: str, query: str, exact: bool) -> tuple[int, int] | None:
+    """一致した元ファイル名の範囲。拡張子を含め、大文字小文字は区別しない。"""
+    if not query:
+        return None
+    if exact:
+        return (0, len(filename)) if filename.casefold() == query.casefold() else None
+
+    # casefoldにより文字数が変化する言語でも、元文字列の正しい範囲を返す。
+    folded_parts = [character.casefold() for character in filename]
+    folded_name = "".join(folded_parts)
+    start_folded = folded_name.find(query.casefold())
+    if start_folded < 0:
+        return None
+    end_folded = start_folded + len(query.casefold())
+    cursor = 0
+    first = None
+    last = None
+    for pos, part in enumerate(folded_parts):
+        following = cursor + len(part)
+        if first is None and following > start_folded:
+            first = pos
+        if first is not None and cursor < end_folded:
+            last = pos + 1
+        cursor = following
+        if cursor >= end_folded:
+            break
+    return (first, last) if first is not None and last is not None else None
 
 # サムネイル生成の同期並列化実験用。
 # 1 / 2 / 4 / 8 に変更して PERF_FOLDER_LOAD の thumbnail_icon_create を比較できる。
@@ -287,8 +321,28 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect, 8, 8)
             painter.restore()
 
-        # アイコン・文字・チェックボックスを通常描画する。
-        super().paint(painter, opt, index)
+        # 通常時はQtの標準描画をそのまま使う。
+        # QStyledItemDelegate.paint() は内部でも initStyleOption() を呼ぶため、
+        # opt.text = "" を設定してから super().paint() しても文字が復活し、
+        # 検索ハイライト用の文字と二重に描かれてしまう。
+        # 一致時だけ、生成済みのオプションでStyleへ直接描画を依頼する。
+        # これでアイコン・チェックボックスの描画はQtに任せつつ、
+        # ファイル名だけを一回描画できる。
+        search_span = index.data(FILENAME_SEARCH_SPAN_ROLE)
+        if search_span is None:
+            super().paint(painter, opt, index)
+        else:
+            filename = opt.text
+            widget = self.parent()
+            style = widget.style() if widget is not None else QApplication.style()
+            name_rect = style.subElementRect(
+                QStyle.SubElement.SE_ItemViewItemText, opt, widget
+            )
+            opt.text = ""
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+            self._paint_highlighted_filename(
+                painter, opt, filename, search_span, name_rect, is_current
+            )
 
         if (
             selection_context == "tagger"
@@ -348,6 +402,62 @@ class ThumbnailItemDelegate(QStyledItemDelegate):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(rect, 8, 8)
 
+        painter.restore()
+
+    @staticmethod
+    def _paint_highlighted_filename(painter, option, filename, span, text_rect, current):
+        """文字列の一致箇所だけを着色。幅不足時もサムネイルの幅を広げない。"""
+        if not text_rect.isValid() or text_rect.width() <= 3:
+            return
+        painter.save()
+        painter.setFont(option.font)
+        fm = painter.fontMetrics()
+        available = max(1, text_rect.width() - 4)
+        shown = fm.elidedText(filename, Qt.TextElideMode.ElideRight, available)
+        # 一致箇所が省略記号の先にある場合は、その箇所からの断片を表示する。
+        # 長いファイル名でも、見えていない文字を「一致」とするだけで終わらせない。
+        visible_origin = 0
+        if shown != filename and span[0] >= max(0, len(shown) - 1):
+            visible_origin = span[0]
+            remaining_width = max(1, available - fm.horizontalAdvance("…"))
+            shown = "…" + fm.elidedText(filename[visible_origin:], Qt.TextElideMode.ElideRight, remaining_width)
+        width = fm.horizontalAdvance(shown)
+        x = text_rect.left() + (text_rect.width() - width) // 2
+        baseline = text_rect.top() + (text_rect.height() + fm.ascent() - fm.descent()) // 2
+        painter.setClipRect(text_rect)
+
+        # 省略記号が表示されても検索範囲を元のファイル名で算出する。
+        # 隠れている文字列は描かず、見えている範囲だけを着色する。
+        if visible_origin:
+            # 表示文字列の頭が省略記号になる分だけ描画座標を1文字ずらす。
+            prefix_len = visible_origin + max(0, len(shown) - 2)
+            start = min(1 + span[0] - visible_origin, len(shown))
+            end = min(1 + span[1] - visible_origin, 1 + max(0, len(shown) - 2))
+        else:
+            prefix_len = len(shown) if shown == filename else max(0, len(shown) - 1)
+            start = min(span[0], prefix_len)
+            end = min(span[1], prefix_len)
+        if start >= end:
+            painter.setPen(QColor('#e8e8e8'))
+            painter.drawText(x, baseline, shown)
+        else:
+            before, marked, after = shown[:start], shown[start:end], shown[end:]
+            before_width = fm.horizontalAdvance(before)
+            marked_width = fm.horizontalAdvance(marked)
+            bg = QColor('#35d878') if current else QColor('#ff4ff3')
+            fg = QColor('#07130b') if current else QColor('#ffffff')
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg)
+            painter.drawRoundedRect(
+                QRect(x + before_width, baseline - fm.ascent() - 1,
+                      max(1, marked_width), fm.height() + 2), 2, 2
+            )
+            painter.setPen(QColor('#e8e8e8'))
+            painter.drawText(x, baseline, before)
+            painter.setPen(fg)
+            painter.drawText(x + before_width, baseline, marked)
+            painter.setPen(QColor('#e8e8e8'))
+            painter.drawText(x + before_width + marked_width, baseline, after)
         painter.restore()
 
 
@@ -634,6 +744,7 @@ class ThumbnailPanel(QFrame):
     tagger_selection_changed = Signal()
     delete_requested = Signal()
     open_tag_file_requested = Signal(int)
+    open_image_folder_requested = Signal(int)
     checked_work_mode_changed = Signal(bool, object)
     tag_filter_view_changed = Signal(bool, object, int, int)
     visible_view_changed = Signal()
@@ -669,6 +780,9 @@ class ThumbnailPanel(QFrame):
         self._tagger_execution_locked = False
         # 可視化要求を世代番号で管理し、連続したフィルタ操作の古い要求を無効化する。
         self._ensure_visible_request_id = 0
+        self._filename_search_matches: list[int] = []
+        self._filename_search_query = ""
+        self._filename_search_exact = False
 
         self.setObjectName("ThumbnailPanel")
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -701,7 +815,99 @@ class ThumbnailPanel(QFrame):
         button_layout.addWidget(self.check_all_button)
         button_layout.addWidget(self.clear_checks_button)
         button_layout.addStretch(1)
+
+        # 既存タグ検索と同じ色・操作感。狭い上部ツールバー向けに
+        # [完全一致] の直下へ [＜][＞][×] を収める。
+        self.filename_search_bar = QFrame()
+        self.filename_search_bar.setObjectName("TagSearchBar")
+        self.filename_search_bar.setStyleSheet(TAG_SEARCH_BAR_QSS)
+        self.filename_search_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.filename_search_bar.setMinimumWidth(245)
+        self.filename_search_bar.setMaximumWidth(360)
+        # 通常操作ボタンの高さを基準に検索バーの高さを固定する。
+        # 一致件数の有無で行全体が伸縮しないようにする。
+        self._filename_search_bar_height = max(34, self.clear_checks_button.sizeHint().height())
+        self.filename_search_bar.setFixedHeight(self._filename_search_bar_height)
+
+        self.filename_search_line = QLineEdit()
+        self.filename_search_line.setPlaceholderText("ファイル名検索")
+        self.filename_search_line.setToolTip(
+            "表示中画像のファイル名を検索。検索しても一覧を絞り込まず、チェック状態も変えません。"
+        )
+        self.filename_search_line.setMinimumWidth(70)
+        # 2段で操作ボタン1行分に収める。上段の入力欄を広めに取る。
+        self.filename_search_line.setFixedHeight(self._filename_search_bar_height - 12)
+        self.filename_search_line.setStyleSheet(
+            "QLineEdit { padding: 1px 7px; font-size: 11px; }"
+        )
+        self.filename_search_line.textChanged.connect(self._set_filename_search_query)
+
+        self.filename_search_count_label = QLabel("")
+        self.filename_search_count_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.filename_search_count_label.setStyleSheet(
+            "color: #ffe58a; font-size: 9px; font-weight: bold; background: transparent;"
+        )
+        self.filename_search_count_label.setFixedHeight(10)
+        # 検索していない場合も行を確保する。表示は空文字にして位置を固定。
+        self.filename_search_count_label.setVisible(True)
+
+        self.filename_search_exact_check = QCheckBox("完全一致")
+        self.filename_search_exact_check.setToolTip("ON時は拡張子を含むファイル名全体と一致した画像だけが対象です。")
+        self.filename_search_exact_check.setFixedWidth(84)
+        self.filename_search_exact_check.setFixedHeight(14)
+        self.filename_search_exact_check.setStyleSheet(
+            "QCheckBox { font-size: 10px; spacing: 3px; background: transparent; }"
+            "QCheckBox::indicator { width: 12px; height: 12px; }"
+        )
+        self.filename_search_exact_check.toggled.connect(self._set_filename_search_exact)
+
+        self.filename_search_prev_button = QPushButton("＜")
+        self.filename_search_next_button = QPushButton("＞")
+        self.filename_search_clear_button = QPushButton("×")
+        for button in (self.filename_search_prev_button, self.filename_search_next_button,
+                       self.filename_search_clear_button):
+            button.setFixedSize(19, 17)
+            button.setStyleSheet(
+                "QPushButton { padding: 0px; font-size: 10px; border-radius: 4px; }"
+            )
+        self.filename_search_prev_button.setToolTip("前の一致画像へ")
+        self.filename_search_next_button.setToolTip("次の一致画像へ")
+        self.filename_search_clear_button.setToolTip("ファイル名検索をクリア")
+        self.filename_search_prev_button.clicked.connect(lambda: self._jump_filename_search_match(-1))
+        self.filename_search_next_button.clicked.connect(lambda: self._jump_filename_search_match(1))
+        self.filename_search_clear_button.clicked.connect(self.filename_search_line.clear)
+        self.filename_search_line.returnPressed.connect(lambda: self._jump_filename_search_match(1))
+
+        filename_field_column = QVBoxLayout()
+        filename_field_column.setContentsMargins(0, 0, 0, 0)
+        filename_field_column.setSpacing(0)
+        filename_field_column.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        filename_field_column.addWidget(self.filename_search_line)
+        filename_field_column.addWidget(self.filename_search_count_label)
+
+        filename_nav_row = QHBoxLayout()
+        filename_nav_row.setContentsMargins(0, 0, 0, 0)
+        filename_nav_row.setSpacing(3)
+        filename_nav_row.addStretch(1)
+        for button in (self.filename_search_prev_button, self.filename_search_next_button,
+                       self.filename_search_clear_button):
+            filename_nav_row.addWidget(button)
+        filename_nav_row.addStretch(1)
+        filename_controls_column = QVBoxLayout()
+        filename_controls_column.setContentsMargins(0, 0, 0, 0)
+        filename_controls_column.setSpacing(1)
+        filename_controls_column.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        filename_controls_column.addWidget(self.filename_search_exact_check)
+        filename_controls_column.addLayout(filename_nav_row)
+
+        filename_bar_layout = QHBoxLayout(self.filename_search_bar)
+        filename_bar_layout.setContentsMargins(5, 0, 5, 0)
+        filename_bar_layout.setSpacing(4)
+        filename_bar_layout.addLayout(filename_field_column, 1)
+        filename_bar_layout.addLayout(filename_controls_column)
+        button_layout.addWidget(self.filename_search_bar, 1)
         button_layout.addWidget(self.delete_images_button)
+        self._update_filename_search_controls()
 
         # サムネイル欄側のフィルタ結果表示バー。
         # 条件の確認・解除操作は右側タグ一覧パネル側へ集約し、
@@ -1016,6 +1222,7 @@ class ThumbnailPanel(QFrame):
             return
 
         self._tagger_preview_index = index
+        self._update_filename_search_controls()
         if self._selection_context == "tagger":
             self._sync_active_context_visuals()
             self.list_widget.scrollToItem(self.list_widget.item(index))
@@ -1077,6 +1284,7 @@ class ThumbnailPanel(QFrame):
             self.list_widget.blockSignals(was_blocked)
 
         self.list_widget.clearSelection()
+        self._update_filename_search_controls()
         self.list_widget.viewport().update()
 
     def _set_tagger_selected_indexes(self, indexes: list[int], selected: bool) -> None:
@@ -1186,6 +1394,91 @@ class ThumbnailPanel(QFrame):
 
         self.recursive_load_settings_changed.emit(self._recursive_load, self._recursive_depth)
 
+    def _set_filename_search_query(self, value: str) -> None:
+        self._filename_search_query = value.strip()
+        # 検索語を入力・変更したら、現在画像が非一致の場合だけ先頭候補へ移動する。
+        # 検索をクリアした場合は画像選択を変更しない。
+        self._refresh_filename_search_matches(auto_select=True)
+
+    def _set_filename_search_exact(self, enabled: bool) -> None:
+        self._filename_search_exact = bool(enabled)
+        # 完全一致の切替も新しい検索条件として扱う。
+        self._refresh_filename_search_matches(auto_select=True)
+
+    def _refresh_filename_search_matches(self, *, auto_select: bool = False) -> None:
+        """可視画像だけを検索・ハイライトし、明示的な検索変更時だけ自動ジャンプする。"""
+        matches: list[int] = []
+        query = self._filename_search_query
+        was_blocked = self.list_widget.blockSignals(True)
+        try:
+            for index, image in enumerate(self.items):
+                if index >= self.list_widget.count():
+                    break
+                widget_item = self.list_widget.item(index)
+                span = (
+                    _filename_match_span(image.image_path.name, query, self._filename_search_exact)
+                    if query and not widget_item.isHidden() else None
+                )
+                if span is not None:
+                    matches.append(index)
+                if widget_item.data(FILENAME_SEARCH_SPAN_ROLE) != span:
+                    widget_item.setData(FILENAME_SEARCH_SPAN_ROLE, span)
+        finally:
+            self.list_widget.blockSignals(was_blocked)
+        self._filename_search_matches = matches
+        # タグフィルタや作業セットの表示再計算では自動ジャンプしない。
+        # ユーザーが検索語・完全一致を変更したときだけ、現在の画像が
+        # 一致しなければ最初の候補へ移動して、0 / N表示を避ける。
+        if auto_select and query and matches and self._active_preview_index() not in matches:
+            self._activate_filename_search_index(matches[0])
+        self._update_filename_search_controls()
+        self.list_widget.viewport().update()
+
+    def _update_filename_search_controls(self) -> None:
+        active = bool(self._filename_search_query)
+        has_matches = active and bool(self._filename_search_matches)
+        self.filename_search_prev_button.setEnabled(has_matches)
+        self.filename_search_next_button.setEnabled(has_matches)
+        self.filename_search_clear_button.setEnabled(active)
+        if not active:
+            label = ""
+        elif not self._filename_search_matches:
+            label = "結果なし"
+        else:
+            # 通常はタグ検索と同じ「現在位置 / 一致総数」。
+            # 検索後に手動で非一致画像を表示した場合も、ヒットなしと誤解される
+            # 0 / N にはせず、検索結果の総件数だけを表示する。
+            current = self._active_preview_index()
+            try:
+                ordinal = self._filename_search_matches.index(current) + 1
+            except ValueError:
+                label = f"{len(self._filename_search_matches)}件"
+            else:
+                label = f"{ordinal} / {len(self._filename_search_matches)}"
+        self.filename_search_count_label.setText(label)
+        # 件数欄は常に確保する。非表示にすると検索時に行の高さが変わる。
+        # active=False 時は上で設定した空文字だけを表示する。
+
+    def _jump_filename_search_match(self, direction: int) -> None:
+        matches = self._filename_search_matches
+        if not matches:
+            return
+        current = self._tagger_preview_index if self._selection_context == "tagger" else self._preview_index
+        if direction > 0:
+            pos = bisect_right(matches, current) % len(matches)
+        else:
+            pos = (bisect_left(matches, current) - 1) % len(matches)
+        self._activate_filename_search_index(matches[pos])
+
+    def _activate_filename_search_index(self, index: int) -> None:
+        """検索結果への移動は通常の画像選択シグナルを使い、既存UIへ反映する。"""
+        if self._selection_context == "tagger":
+            self.tagger_image_selected.emit(index)
+        else:
+            self.image_selected.emit(index)
+        # AppWindowの選択同期を優先。サムネイルが画面外ならスクロールする。
+        self.ensure_index_visible(index)
+
     def _on_thumbnail_context_menu(self, pos) -> None:
         """サムネイル右クリックメニュー。"""
         widget_item = self.list_widget.itemAt(pos)
@@ -1207,12 +1500,19 @@ class ThumbnailPanel(QFrame):
 
         menu = QMenu(self)
         open_txt_action = menu.addAction("対応txtを開く")
+        open_folder_action = menu.addAction("画像フォルダを開く")
+        copy_filename_action = menu.addAction("ファイル名をコピーする")
 
         # カーソル直下にメニューが重なると項目が見づらいため、少し右下へずらして表示する。
         menu_pos = self.list_widget.viewport().mapToGlobal(pos + QPoint(24, 4))
         selected_action = menu.exec(menu_pos)
         if selected_action == open_txt_action:
             self.open_tag_file_requested.emit(index)
+        elif selected_action == open_folder_action:
+            self.open_image_folder_requested.emit(index)
+        elif selected_action == copy_filename_action:
+            # 選択中プレビューではなく、右クリックされた画像の実ファイル名。
+            QApplication.clipboard().setText(self.items[index].image_path.name)
 
     def _make_thumbnail_icon(self, image_path: Path) -> QIcon:
         """単体再生成用。画像生成はQImage経路、QIcon化はGUIスレッドで行う。"""
@@ -1257,6 +1557,14 @@ class ThumbnailPanel(QFrame):
 
         self.items = items
         self.folder = folder
+        if folder_changed:
+            # 別フォルダへ前の検索語を引き継がず、既存のチェック・表示範囲のみ復元する。
+            blocked = self.filename_search_line.blockSignals(True)
+            try:
+                self.filename_search_line.clear()
+            finally:
+                self.filename_search_line.blockSignals(blocked)
+            self._filename_search_query = ""
         if recursive is not None or recursive_depth is not None:
             self.set_recursive_load_settings(
                 self._recursive_load if recursive is None else bool(recursive),
@@ -1323,6 +1631,7 @@ class ThumbnailPanel(QFrame):
             widget_item.setData(PREVIEW_ROLE, False)
             widget_item.setData(TAGGER_STATUS_ROLE, None)
             widget_item.setData(SELECTION_CONTEXT_ROLE, self._selection_context)
+            widget_item.setData(FILENAME_SEARCH_SPAN_ROLE, None)
             widget_item.setFlags(
                 widget_item.flags()
                 | Qt.ItemFlag.ItemIsUserCheckable
@@ -1404,6 +1713,7 @@ class ThumbnailPanel(QFrame):
             self.list_widget.blockSignals(was_blocked)
 
         self.list_widget.scrollToItem(current_item)
+        self._update_filename_search_controls()
         self.list_widget.viewport().update()
 
     def ensure_index_visible(self, index: int) -> None:
@@ -1980,6 +2290,7 @@ class ThumbnailPanel(QFrame):
 
         notify_started = time.perf_counter()
         self._update_filter_bar(visible_count)
+        self._refresh_filename_search_matches()
         if changed_hidden_count > 0:
             self.visible_view_changed.emit()
         notify_ms = (time.perf_counter() - notify_started) * 1000

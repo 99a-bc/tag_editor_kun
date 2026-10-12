@@ -89,7 +89,7 @@ def main() -> int:
     log_file = configure_logging()
     log = get_logger(__name__)
     install_qt_message_handler(log)
-    log_user_info("タグエディタ君 v1.1.0 を起動しています...")
+    log_user_info("タグエディタ君 v1.2.0 を起動しています...")
     log.info("main.py loaded from: %s", Path(__file__).resolve())
     log.info("log file: %s", log_file)
 

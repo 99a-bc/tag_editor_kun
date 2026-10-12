@@ -1,11 +1,74 @@
 from __future__ import annotations
 
 from pathlib import Path
-from html import escape
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from filename_status import SelectableFilenameStatus
+
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QHBoxLayout,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+def _apply_button_glow(button: QPushButton, color: str, *, blur_radius: float = 20.0) -> None:
+    """右上操作ボタンへ常時の薄い発光を付ける。"""
+    effect = QGraphicsDropShadowEffect(button)
+    effect.setBlurRadius(blur_radius)
+    effect.setOffset(0, 0)
+    glow_color = QColor(color)
+    glow_color.setAlpha(190)
+    effect.setColor(glow_color)
+    button.setGraphicsEffect(effect)
+
+
+
+_STATUS_PREFERRED_WIDTH = 920
+_STATUS_MIN_WIDTH = 460
+_STATUS_SIDE_RESERVE = 40
+
+
+def _update_status_label_width(label: SelectableFilenameStatus, container_width: int) -> int:
+    """ステータス欄を長めの一定幅に寄せつつ、狭い画面では収まる幅まで縮める。"""
+    available = max(280, int(container_width) - _STATUS_SIDE_RESERVE)
+    width = min(_STATUS_PREFERRED_WIDTH, available)
+    if available >= _STATUS_MIN_WIDTH:
+        width = max(_STATUS_MIN_WIDTH, width)
+    label.setFixedWidth(max(280, width))
+    return label.width()
+
+
+def _set_expanded_status(
+    status: SelectableFilenameStatus,
+    path: Path,
+    *,
+    position: int,
+    total: int,
+    checked: bool,
+    selection_context: str,
+) -> None:
+    """ファイル名のみ選択可能とし、ステータス表示は2行固定で維持。"""
+    if checked:
+        check_color = "#57d8c4" if selection_context == "tagger" else "#ffe58a"
+        check_text = f'<span style="color:{check_color}; font-weight:700;">● チェック中</span>'
+    else:
+        check_text = '<span style="color:#eeeeee;">○ 未チェック</span>'
+
+    controls = (
+        "←/→・◁/▷: 前後移動　Space: チェック切替　"
+        "ホイール: ズーム　左ドラッグ: 移動　"
+        "ダブルクリック: フィット　Esc / × / 背景クリック: 閉じる"
+    )
+    status.set_filename_line(
+        path.name,
+        suffix=f"　{position + 1}/{max(1, total)}　{check_text}",
+        controls=controls,
+    )
 
 
 class ZoomableImageCanvas(QWidget):
@@ -108,14 +171,21 @@ class ZoomableImageCanvas(QWidget):
 
         # 画像の下敷きになるカード領域。サムネイルと同じ比率に固定し、
         # チェック枠もこのカード外周へ出すことで、サムネイル欄と意味を揃える。
-        painter.setPen(QPen(QColor(255, 255, 255, 32), 1))
-        painter.setBrush(QColor(0, 0, 0, 92))
+        # 暗幕の外側と区別できるよう、内側はさらに暗く、枠は明るく表示する。
+        # 画像自体は暗くしない（画像描画前のカード下敷きだけ変更）。
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 190))
         painter.drawRoundedRect(card_rect, 10, 10)
 
         painter.save()
         painter.setClipRect(card_rect.adjusted(1, 1, -1, -1))
         painter.drawPixmap(self._target_rect(), self._pixmap, QRectF(self._pixmap.rect()))
         painter.restore()
+
+        # 元画像を描き終えてからカード枠を重ね、画像の端にも見えるようにする。
+        painter.setPen(QPen(QColor(235, 245, 255, 150), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(card_rect.adjusted(1, 1, -1, -1), 10, 10)
 
         if self._checked:
             # サムネイル欄の選択文脈と同じ意味・色をライトボックスでも示す。
@@ -315,6 +385,7 @@ class ImageLightbox(QFrame):
     previous_requested = Signal()
     next_requested = Signal()
     check_toggle_requested = Signal()
+    embedded_preview_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -325,7 +396,7 @@ class ImageLightbox(QFrame):
         self.setStyleSheet(
             """
             QFrame#ImageLightbox {
-                background: rgba(0, 0, 0, 205);
+                background: rgba(0, 0, 0, 160);
             }
             QPushButton#LightboxNavButton {
                 color: rgba(255, 255, 255, 210);
@@ -340,18 +411,37 @@ class ImageLightbox(QFrame):
                 color: rgba(255, 255, 255, 245);
             }
             QPushButton#LightboxCloseButton {
-                color: rgba(255, 255, 255, 220);
-                background: rgba(0, 0, 0, 70);
-                border: 1px solid rgba(255, 255, 255, 75);
-                border-radius: 15px;
-                font-size: 20px;
+                color: #ffffff;
+                background: rgba(92, 24, 34, 205);
+                border: 2px solid rgba(255, 118, 135, 235);
+                border-radius: 22px;
+                font-size: 28px;
                 font-weight: bold;
             }
             QPushButton#LightboxCloseButton:hover {
-                background: rgba(255, 80, 80, 105);
+                background: rgba(150, 35, 52, 235);
+                border-color: #ff9aaa;
                 color: #ffffff;
             }
-            QLabel#LightboxStatus {
+            QPushButton#LightboxEmbeddedPreviewButton {
+                color: #f1f9ff;
+                background: rgba(31, 73, 102, 225);
+                border: 2px solid rgba(113, 202, 255, 245);
+                border-radius: 11px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 6px 10px;
+            }
+            QPushButton#LightboxEmbeddedPreviewButton:hover {
+                color: #ffffff;
+                background: rgba(49, 108, 147, 240);
+                border-color: #a8e2ff;
+            }
+            QPushButton#LightboxEmbeddedPreviewButton:pressed {
+                background: rgba(32, 78, 108, 245);
+                border-color: #d0efff;
+            }
+            QFrame#LightboxStatus {
                 color: #eeeeee;
                 background: rgba(0, 0, 0, 95);
                 border-radius: 7px;
@@ -362,9 +452,22 @@ class ImageLightbox(QFrame):
 
         self.close_button = QPushButton("×")
         self.close_button.setObjectName("LightboxCloseButton")
-        self.close_button.setFixedSize(32, 32)
+        self.close_button.setFixedSize(44, 44)
         self.close_button.setToolTip("閉じる")
         self.close_button.clicked.connect(self.close_overlay)
+
+        self.embedded_preview_button = QPushButton("拡大プレビュー", self)
+        self.embedded_preview_button.setObjectName("LightboxEmbeddedPreviewButton")
+        self.embedded_preview_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.embedded_preview_button.setToolTip(
+            "タグ操作を残したまま使える拡大プレビューへ切り替えます"
+        )
+        self.embedded_preview_button.setFixedSize(132, 42)
+        self.embedded_preview_button.clicked.connect(
+            self.embedded_preview_requested.emit
+        )
+        _apply_button_glow(self.close_button, "#ff667d", blur_radius=22.0)
+        _apply_button_glow(self.embedded_preview_button, "#63c9ff", blur_radius=24.0)
 
         self.previous_button = QPushButton("◁")
         self.previous_button.setObjectName("LightboxNavButton")
@@ -382,11 +485,9 @@ class ImageLightbox(QFrame):
         self.canvas.setMinimumSize(240, 160)
         self.canvas.background_clicked.connect(self.close_overlay)
 
-        self.status_label = QLabel("")
+        self.status_label = SelectableFilenameStatus(expanded=True)
         self.status_label.setObjectName("LightboxStatus")
-        self.status_label.setTextFormat(Qt.TextFormat.RichText)
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.status_label.background_clicked.connect(self.close_overlay)
 
         top_layout = QHBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
@@ -401,13 +502,23 @@ class ImageLightbox(QFrame):
         center_layout.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 16, 22, 18)
+        layout.setContentsMargins(22, 16, 48, 18)
         layout.setSpacing(8)
         layout.addLayout(top_layout)
         layout.addLayout(center_layout, 1)
         layout.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignCenter)
 
         self.hide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 切替ボタンは画像レイアウトを押し下げず、右上の×の真下へ浮かせる。
+        margin_right = 48
+        top = 16 + self.close_button.height() + 10
+        x = max(8, self.width() - margin_right - self.embedded_preview_button.width())
+        self.embedded_preview_button.move(x, top)
+        self.embedded_preview_button.raise_()
+        _update_status_label_width(self.status_label, self.width())
 
     def show_image(
         self,
@@ -435,22 +546,14 @@ class ImageLightbox(QFrame):
             selection_context="tagger" if is_tagger_context else "edit",
         )
 
-        if checked:
-            check_color = "#57d8c4" if is_tagger_context else "#ffe58a"
-            check_text = (
-                f'<span style="color: {check_color}; font-weight: 700;">'
-                "● チェック中</span>"
-            )
-        else:
-            check_text = '<span style="color: #eeeeee;">○ 未チェック</span>'
-        total = max(1, total)
-        position_text = f"{position + 1}/{total}"
-        filename = escape(path.name)
-        self.status_label.setText(
-            f"{filename}　{position_text}　{check_text}　｜　"
-            "←/→・◁/▷: 前後移動　Space: チェック切替　"
-            "ホイール: ズーム　左ドラッグ: 移動　"
-            "ダブルクリック: フィット　Esc / × / 背景クリック: 閉じる"
+        _update_status_label_width(self.status_label, self.width())
+        _set_expanded_status(
+            self.status_label,
+            path,
+            position=position,
+            total=total,
+            checked=checked,
+            selection_context=selection_context,
         )
         self.show()
         self.raise_()
@@ -499,3 +602,242 @@ class ImageLightbox(QFrame):
             event.accept()
             return
         super().mousePressEvent(event)
+
+class EmbeddedImageViewer(QFrame):
+    """
+    左側の通常プレビュー＋サムネイル領域へ重ねて使う埋め込み拡大プレビュー。
+
+    画像表示ロジックはライトボックスと同じ ZoomableImageCanvas を共有し、
+    元画像のfit表示・ホイールズーム・左ドラッグパン・ダブルクリックfitを揃える。
+    半透明背景で通常プレビュー／サムネイルを薄く残し、右側タグパネルは覆わない。
+    """
+
+    previous_requested = Signal()
+    next_requested = Signal()
+    check_toggle_requested = Signal()
+    exit_requested = Signal()
+    lightbox_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("EmbeddedImageViewer")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._current_path: Path | None = None
+
+        self.setStyleSheet(
+            """
+            QFrame#EmbeddedImageViewer {
+                background: rgba(0, 0, 0, 205);
+                border: 1px solid rgba(255, 255, 255, 32);
+                border-radius: 10px;
+            }
+            QPushButton#EmbeddedPreviewNavButton {
+                color: rgba(255, 255, 255, 220);
+                background: rgba(0, 0, 0, 70);
+                border: 1px solid rgba(255, 255, 255, 75);
+                border-radius: 20px;
+                font-size: 30px;
+                font-weight: bold;
+            }
+            QPushButton#EmbeddedPreviewNavButton:hover {
+                background: rgba(255, 255, 255, 42);
+                color: #ffffff;
+                border-color: rgba(255, 255, 255, 125);
+            }
+            QPushButton#EmbeddedPreviewCloseButton {
+                color: #ffffff;
+                background: rgba(92, 24, 34, 205);
+                border: 2px solid rgba(255, 118, 135, 235);
+                border-radius: 22px;
+                font-size: 28px;
+                font-weight: bold;
+            }
+            QPushButton#EmbeddedPreviewCloseButton:hover {
+                background: rgba(150, 35, 52, 235);
+                border-color: #ff9aaa;
+                color: #ffffff;
+            }
+            QPushButton#EmbeddedPreviewModeButton {
+                color: #f1f9ff;
+                background: rgba(31, 73, 102, 225);
+                border: 2px solid rgba(113, 202, 255, 245);
+                border-radius: 11px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 6px 10px;
+            }
+            QPushButton#EmbeddedPreviewModeButton:hover {
+                color: #ffffff;
+                background: rgba(49, 108, 147, 240);
+                border-color: #a8e2ff;
+            }
+            QPushButton#EmbeddedPreviewModeButton:pressed {
+                background: rgba(32, 78, 108, 245);
+                border-color: #d0efff;
+            }
+            QFrame#EmbeddedPreviewStatus {
+                color: #eeeeee;
+                background: rgba(0, 0, 0, 105);
+                border: 1px solid rgba(255, 255, 255, 32);
+                border-radius: 7px;
+                padding: 5px 10px;
+            }
+            """
+        )
+
+        self.close_button = QPushButton("×", self)
+        self.close_button.setObjectName("EmbeddedPreviewCloseButton")
+        self.close_button.setFixedSize(44, 44)
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_button.setToolTip("拡大プレビューを閉じる")
+        self.close_button.clicked.connect(self.exit_requested.emit)
+
+        self.mode_button = QPushButton("拡大確認表示", self)
+        self.mode_button.setObjectName("EmbeddedPreviewModeButton")
+        self.mode_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_button.setToolTip("全画面の拡大確認表示へ切り替えます")
+        self.mode_button.setFixedSize(132, 42)
+        self.mode_button.clicked.connect(self.lightbox_requested.emit)
+        _apply_button_glow(self.close_button, "#ff667d", blur_radius=22.0)
+        _apply_button_glow(self.mode_button, "#63c9ff", blur_radius=24.0)
+
+        self.previous_button = QPushButton("◁")
+        self.previous_button.setObjectName("EmbeddedPreviewNavButton")
+        self.previous_button.setFixedSize(52, 88)
+        self.previous_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.previous_button.setToolTip("前の画像")
+        self.previous_button.clicked.connect(self.previous_requested.emit)
+
+        self.next_button = QPushButton("▷")
+        self.next_button.setObjectName("EmbeddedPreviewNavButton")
+        self.next_button.setFixedSize(52, 88)
+        self.next_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.next_button.setToolTip("次の画像")
+        self.next_button.clicked.connect(self.next_requested.emit)
+
+        self.canvas = ZoomableImageCanvas()
+        self.canvas.setMinimumSize(240, 160)
+        self.canvas.installEventFilter(self)
+        self.canvas.background_clicked.connect(self.exit_requested.emit)
+
+        self.status_label = SelectableFilenameStatus(expanded=True)
+        self.status_label.setObjectName("EmbeddedPreviewStatus")
+        self.status_label.background_clicked.connect(self.exit_requested.emit)
+
+        center_layout = QHBoxLayout()
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(10)
+        center_layout.addWidget(self.previous_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        center_layout.addWidget(self.canvas, 1)
+        center_layout.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        layout.addLayout(center_layout, 1)
+        layout.addWidget(self.status_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        self.hide()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        margin_right = 38
+        top = 12
+        close_x = max(8, self.width() - margin_right - self.close_button.width())
+        self.close_button.move(close_x, top)
+        self.close_button.raise_()
+
+        mode_top = top + self.close_button.height() + 10
+        mode_x = max(8, self.width() - margin_right - self.mode_button.width())
+        self.mode_button.move(mode_x, mode_top)
+        self.mode_button.raise_()
+        _update_status_label_width(self.status_label, self.width())
+
+    def show_image(
+        self,
+        path: Path,
+        *,
+        position: int = 0,
+        total: int = 1,
+        checked: bool = False,
+        selection_context: str = "edit",
+        take_focus: bool = True,
+    ) -> bool:
+        """
+        指定画像を表示する。同じ画像のチェック状態だけが変わった場合は、
+        ライトボックスと同様にズーム・パン状態を維持する。
+        """
+        if self._current_path != path:
+            pixmap = QPixmap(str(path))
+            if pixmap.isNull():
+                return False
+
+            self.canvas.set_pixmap(pixmap)
+            self._current_path = path
+
+        is_tagger_context = selection_context == "tagger"
+        self.canvas.set_checked(
+            checked,
+            selection_context="tagger" if is_tagger_context else "edit",
+        )
+
+        _update_status_label_width(self.status_label, self.width())
+        _set_expanded_status(
+            self.status_label,
+            path,
+            position=position,
+            total=total,
+            checked=checked,
+            selection_context=selection_context,
+        )
+        self.show()
+        self.raise_()
+        if take_focus:
+            self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
+        return True
+
+    def clear_view(self) -> None:
+        self._current_path = None
+        self.status_label.clear()
+        self.canvas.clear_image()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        key = event.key()
+
+        if key == Qt.Key.Key_Escape:
+            self.exit_requested.emit()
+            event.accept()
+            return
+
+        if key == Qt.Key.Key_Left:
+            self.previous_requested.emit()
+            event.accept()
+            return
+
+        if key == Qt.Key.Key_Right:
+            self.next_requested.emit()
+            event.accept()
+            return
+
+        if key == Qt.Key.Key_Space:
+            self.check_toggle_requested.emit()
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self.canvas.geometry().contains(event.position().toPoint())
+        ):
+            self.exit_requested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self.canvas and event.type() == QEvent.Type.MouseButtonPress:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        return super().eventFilter(watched, event)

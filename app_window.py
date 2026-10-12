@@ -15,21 +15,26 @@ from logger import (
 )
 from dev_config import dev_log_enabled
 
-from PySide6.QtCore import Qt, QFile, QTimer, QUrl
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import QEvent, Qt, QFile, QTimer, QUrl
+from PySide6.QtGui import QAction, QCursor, QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from models import IMAGE_EXTENSIONS, ImageItem
-from image_lightbox import ImageLightbox
+from image_lightbox import EmbeddedImageViewer, ImageLightbox
+from mouse_gesture import MouseGestureController
 from preferences_dialog import PreferencesDialog
 from preview_panel import PreviewPanel
 from settings import (
@@ -46,6 +51,7 @@ from tagger.result import TagCandidate, TaggerResult
 from tagger.session import TaggerSession
 from tagger_panel import TaggerPanel
 from thumbnail_panel import ThumbnailPanel
+from windows_shell import open_folder_and_select_file
 from theme import APP_QSS, enable_windows_dark_title_bar
 
 
@@ -170,7 +176,7 @@ def _sort_image_paths_like_explorer(paths: list[Path], folder: Path, *, recursiv
 class AppWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("タグエディタ君 v1.1.0")
+        self.setWindowTitle("タグエディタ君 v1.2.0")
         self.resize(1440, 900)
 
         self.folder: Path | None = None
@@ -192,6 +198,13 @@ class AppWindow(QMainWindow):
         self._lightbox_source: str = "normal"
         self._lightbox_indexes: list[int] = []
         self._lightbox_position: int = 0
+        # 左側の通常プレビュー＋サムネイルと切り替える埋め込み拡大プレビュー。
+        self._embedded_preview_active: bool = False
+        self._embedded_preview_source: str = "normal"
+        self._embedded_preview_indexes: list[int] = []
+        self._embedded_preview_position: int = 0
+        # 埋め込み側から select_image / select_tagger_image を呼んだ時の再同期ループ防止。
+        self._embedded_preview_internal_selection: bool = False
         self._perf_filter_sequence: int = 0
         # checks_changed は、Qt側の itemChanged や内部更新の都合で短時間に複数回届くことがある。
         # 重いタグ再集計は直接実行せず、短いタイマーでまとめて1回だけ処理する。
@@ -206,12 +219,21 @@ class AppWindow(QMainWindow):
 
         self._hover_preview_restore_timer = QTimer(self)
         self._hover_preview_restore_timer.setSingleShot(True)
-        self._hover_preview_restore_timer.setInterval(250)
+        # タグ欄⇔プレビュー欄の狭い境界だけに使う短い接続猶予。
+        # サムネイル等へ離れた場合は待機せず通常プレビューへ戻す。
+        self._hover_preview_restore_timer.setInterval(70)
         self._hover_preview_restore_timer.timeout.connect(
             self._finish_hover_preview_if_outside
         )
 
         self.setAcceptDrops(True)
+
+        # 埋め込み拡大プレビュー中は、右側タグパネルへフォーカスが移っていても
+        # ←/→・Space・Esc をプレビュー操作として扱う。
+        # QApplication側で拾うことで、個々のタグボタンのFocusPolicyには依存しない。
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         self._setup_menu_bar()
 
@@ -260,6 +282,7 @@ class AppWindow(QMainWindow):
         self.thumbnail_panel.checks_changed.connect(self._on_checks_changed)
         self.thumbnail_panel.delete_requested.connect(self.delete_checked_images_to_trash)
         self.thumbnail_panel.open_tag_file_requested.connect(self.open_tag_file_for_index)
+        self.thumbnail_panel.open_image_folder_requested.connect(self.open_image_folder_for_index)
         self.thumbnail_panel.checked_work_mode_changed.connect(self._on_checked_work_mode_changed)
         self.thumbnail_panel.tag_filter_view_changed.connect(self.tag_panel.set_tag_filter_view)
         self.thumbnail_panel.visible_view_changed.connect(self._on_thumbnail_visible_view_changed)
@@ -279,12 +302,42 @@ class AppWindow(QMainWindow):
         self.tagger_panel.settings_changed.connect(self._on_tagger_settings_changed)
         self.tag_panel.tabs.currentChanged.connect(self._on_tag_panel_tab_changed)
 
-        left_layout = QVBoxLayout()
-        left_layout.addWidget(self.preview_panel, 1)
-        left_layout.addWidget(self.thumbnail_panel, 1)
+        # 左側の通常表示（プレビュー＋サムネイル）は常に残し、その上へ
+        # 半透明の埋め込み拡大プレビューをオーバーレイする。
+        # これにより、拡大プレビューの暗幕越しにも通常表示を薄く見せられる。
+        self._normal_left_page = QWidget()
+        normal_left_layout = QVBoxLayout(self._normal_left_page)
+        normal_left_layout.setContentsMargins(0, 0, 0, 0)
+        normal_left_layout.setSpacing(6)
+        normal_left_layout.addWidget(self.preview_panel, 1)
+        normal_left_layout.addWidget(self.thumbnail_panel, 1)
+
+        self._left_view_host = QWidget()
+        left_host_layout = QVBoxLayout(self._left_view_host)
+        left_host_layout.setContentsMargins(0, 0, 0, 0)
+        left_host_layout.setSpacing(0)
+        left_host_layout.addWidget(self._normal_left_page)
+
+        self.embedded_preview = EmbeddedImageViewer(self._left_view_host)
+        self.embedded_preview.previous_requested.connect(
+            lambda: self._navigate_embedded_preview(-1)
+        )
+        self.embedded_preview.next_requested.connect(
+            lambda: self._navigate_embedded_preview(1)
+        )
+        self.embedded_preview.check_toggle_requested.connect(
+            self._toggle_embedded_preview_current_check
+        )
+        self.embedded_preview.exit_requested.connect(
+            lambda: self._set_embedded_preview_active(False)
+        )
+        self.embedded_preview.lightbox_requested.connect(
+            self._activate_lightbox_from_embedded_preview
+        )
+        self.embedded_preview.hide()
 
         main_layout = QHBoxLayout()
-        main_layout.addLayout(left_layout, 1)
+        main_layout.addWidget(self._left_view_host, 1)
         main_layout.addWidget(self.tag_panel, 1)
 
         root_layout = QVBoxLayout()
@@ -300,7 +353,16 @@ class AppWindow(QMainWindow):
         self.lightbox.previous_requested.connect(lambda: self._navigate_lightbox(-1))
         self.lightbox.next_requested.connect(lambda: self._navigate_lightbox(1))
         self.lightbox.check_toggle_requested.connect(self._toggle_lightbox_current_check)
+        self.lightbox.embedded_preview_requested.connect(
+            self._activate_embedded_preview_from_lightbox
+        )
         self.lightbox.setGeometry(central.rect())
+
+        # ①通常表示 / ②拡大確認 / ③拡大プレビューに共通の右ドラッグ操作。
+        # 描画用レイヤーはマウス透過とし、既存のタグ右クリックメニュー等は維持する。
+        self._mouse_gesture = MouseGestureController(
+            self, central, self._navigate_from_mouse_gesture
+        )
 
         self.setStyleSheet(APP_QSS)
         enable_windows_dark_title_bar(self)
@@ -330,12 +392,350 @@ class AppWindow(QMainWindow):
         self.preferences_action.triggered.connect(self.open_preferences)
         tools_menu.addAction(self.preferences_action)
 
+    @staticmethod
+    def _embedded_preview_key_should_pass_to_focus_widget(widget: QWidget | None) -> bool:
+        """文字入力中は拡大プレビュー用キーを奪わず、入力Widgetへ渡す。"""
+        if widget is None:
+            return False
+        return isinstance(
+            widget,
+            (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox),
+        )
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        """アプリ共通の右ドラッグと③拡大プレビューのキーを処理する。"""
+        if hasattr(self, "_mouse_gesture"):
+            if self._mouse_gesture.process(watched, event):
+                return True
+            if watched is self.centralWidget() and event.type() == QEvent.Type.Resize:
+                self._mouse_gesture.resize_overlay()
+        if (
+            self._embedded_preview_active
+            and event.type() == QEvent.Type.KeyPress
+            and QApplication.activeModalWidget() is None
+            and QApplication.activePopupWidget() is None
+        ):
+            # 別ウインドウがアクティブな時は横取りしない。
+            active_window = QApplication.activeWindow()
+            if active_window is self:
+                focus_widget = QApplication.focusWidget()
+                if not self._embedded_preview_key_should_pass_to_focus_widget(focus_widget):
+                    modifiers = event.modifiers()
+                    allowed_modifiers = (
+                        Qt.KeyboardModifier.NoModifier,
+                        Qt.KeyboardModifier.KeypadModifier,
+                    )
+                    if modifiers in allowed_modifiers:
+                        key = event.key()
+                        if key == Qt.Key.Key_Left:
+                            self._navigate_embedded_preview(-1)
+                            event.accept()
+                            return True
+                        if key == Qt.Key.Key_Right:
+                            self._navigate_embedded_preview(1)
+                            event.accept()
+                            return True
+                        if key == Qt.Key.Key_Space:
+                            self._toggle_embedded_preview_current_check()
+                            event.accept()
+                            return True
+                        if key == Qt.Key.Key_Escape:
+                            self._set_embedded_preview_active(False)
+                            event.accept()
+                            return True
+
+        return super().eventFilter(watched, event)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         if hasattr(self, "lightbox") and self.centralWidget() is not None:
             self.lightbox.setGeometry(self.centralWidget().rect())
+        self._resize_embedded_preview_overlay()
+        if hasattr(self, "_mouse_gesture"):
+            self._mouse_gesture.resize_overlay()
+
+    def _resize_embedded_preview_overlay(self) -> None:
+        if not hasattr(self, "embedded_preview") or not hasattr(self, "_left_view_host"):
+            return
+        self.embedded_preview.setGeometry(self._left_view_host.rect())
+        if self._embedded_preview_active:
+            self.embedded_preview.raise_()
+
+    def _set_enlarged_preview_mode_preference(self, mode: str) -> None:
+        """拡大表示の既定モードを保存する。"""
+        normalized = "embedded" if mode == "embedded" else "lightbox"
+        if self.app_settings.enlarged_preview_mode == normalized:
+            return
+
+        self.app_settings.enlarged_preview_mode = normalized
+        try:
+            save_app_settings(self.app_settings)
+        except OSError as error:
+            log.warning("failed to save enlarged preview mode: %s", error)
+
+    def _update_base_preview_suppression(self) -> None:
+        """拡大系モード中は元のPreviewPanel内容だけを隠し、終了時に復元する。"""
+        suppressed = bool(self._lightbox_active or self._embedded_preview_active)
+        self.preview_panel.set_content_suppressed(suppressed)
+
+    def _set_embedded_preview_active(self, active: bool) -> None:
+        """埋め込み拡大プレビューの表示状態を切り替える。"""
+        active = bool(active)
+        if active:
+            if self._embedded_preview_active:
+                self._resize_embedded_preview_overlay()
+                self.embedded_preview.show()
+                self.embedded_preview.raise_()
+            return
+
+        if not self._embedded_preview_active:
+            return
+
+        self._embedded_preview_active = False
+        self._embedded_preview_source = "normal"
+        self._embedded_preview_indexes = []
+        self._embedded_preview_position = 0
+        self.embedded_preview.hide()
+        self.embedded_preview.clear_view()
+        self._update_base_preview_suppression()
+        self._hover_preview_restore_timer.stop()
+        self._update_preview_placeholder_state()
+
+    def _show_embedded_preview(self, path: Path, source: str = "normal") -> None:
+        """通常プレビュー等から、設定済み文脈で埋め込み拡大プレビューを開く。"""
+        index = self._index_for_image_path(path)
+        if index is None:
+            QMessageBox.warning(self, "拡大プレビュー", f"画像が現在の一覧にありません。\n{path.name}")
+            return
+        if not path.exists():
+            QMessageBox.warning(self, "拡大プレビュー", f"画像ファイルが見つかりません。\n{path.name}")
+            return
+
+        indexes = self._lightbox_target_indexes(source)
+        if not indexes:
+            indexes = [index]
+        if index not in indexes:
+            indexes = [index]
+
+        self._embedded_preview_source = "checked" if source == "checked" else "normal"
+        self._embedded_preview_indexes = indexes
+        self._embedded_preview_position = indexes.index(index)
+        self._embedded_preview_active = True
+        self._update_base_preview_suppression()
+        self._hover_preview_restore_timer.stop()
+        self._resize_embedded_preview_overlay()
+        self.embedded_preview.show()
+        self.embedded_preview.raise_()
+
+        if not self._show_embedded_preview_current():
+            self._set_embedded_preview_active(False)
+
+    def _activate_embedded_preview_from_lightbox(self) -> None:
+        """全画面ライトボックスの現在位置・対象文脈を引き継いで切り替える。"""
+        if self._tagger_execution_is_active():
+            return
+        if not self._lightbox_active or not self._lightbox_indexes:
+            return
+        if not (0 <= self._lightbox_position < len(self._lightbox_indexes)):
+            return
+
+        source = self._lightbox_source
+        current_index = self._lightbox_indexes[self._lightbox_position]
+        if not (0 <= current_index < len(self.items)):
+            return
+        path = self.items[current_index].image_path
+
+        self._set_enlarged_preview_mode_preference("embedded")
+        # 埋め込み側を先に有効化してからライトボックスを閉じることで、
+        # 背後PreviewPanelの抑制をモード切替中も途切れさせない。
+        self._show_embedded_preview(path, source)
+        self.lightbox.close_overlay()
+
+    def _activate_lightbox_from_embedded_preview(self) -> None:
+        """埋め込み拡大プレビューから全画面ライトボックスへ切り替える。"""
+        if self._tagger_execution_is_active():
+            return
+        if not self._embedded_preview_active or not self._embedded_preview_indexes:
+            return
+        if not (0 <= self._embedded_preview_position < len(self._embedded_preview_indexes)):
+            return
+
+        source = self._embedded_preview_source
+        current_index = self._embedded_preview_indexes[self._embedded_preview_position]
+        if not (0 <= current_index < len(self.items)):
+            return
+        path = self.items[current_index].image_path
+
+        self._set_enlarged_preview_mode_preference("lightbox")
+        # ライトボックスを先に有効化し、元プレビューの抑制を保ったまま切り替える。
+        self._show_lightbox_direct(path, source)
+        if self._lightbox_active:
+            self._set_embedded_preview_active(False)
+
+    def _show_embedded_preview_current(self) -> bool:
+        if not self._embedded_preview_active or not self._embedded_preview_indexes:
+            return False
+
+        self._embedded_preview_position %= len(self._embedded_preview_indexes)
+        index = self._embedded_preview_indexes[self._embedded_preview_position]
+        if not (0 <= index < len(self.items)):
+            return False
+
+        item = self.items[index]
+        if not item.image_path.exists():
+            QMessageBox.warning(
+                self,
+                "拡大プレビュー",
+                f"画像ファイルが見つかりません。\n{item.image_path.name}",
+            )
+            return False
+
+        self._embedded_preview_internal_selection = True
+        try:
+            if self._tagger_tab_is_active():
+                self.select_tagger_image(index)
+                checked = index in self.thumbnail_panel.tagger_selected_indexes()
+                selection_context = "tagger"
+            else:
+                self.select_image(index)
+                checked = item.checked
+                selection_context = "edit"
+        finally:
+            self._embedded_preview_internal_selection = False
+
+        if not self.embedded_preview.show_image(
+            item.image_path,
+            position=self._embedded_preview_position,
+            total=len(self._embedded_preview_indexes),
+            checked=checked,
+            selection_context=selection_context,
+        ):
+            QMessageBox.warning(
+                self,
+                "拡大プレビュー",
+                f"画像を読み込めませんでした。\n{item.image_path.name}",
+            )
+            return False
+
+        return True
+
+    def _sync_embedded_preview_to_index(self, index: int) -> None:
+        """
+        フィルタ再評価など本体側から現在画像が変わった時も、
+        埋め込み拡大プレビューを同じ画像へ追従させる。
+        """
+        if (
+            not self._embedded_preview_active
+            or self._embedded_preview_internal_selection
+            or not (0 <= index < len(self.items))
+        ):
+            return
+
+        indexes = self._lightbox_target_indexes(self._embedded_preview_source)
+        if not indexes:
+            self._set_embedded_preview_active(False)
+            return
+
+        if index not in indexes:
+            # checked文脈では、外部要因で非チェック画像へ現在位置が移っても
+            # 操作対象プレビューの対象自体は変えない。
+            if self._embedded_preview_source == "checked":
+                return
+            index = indexes[0]
+
+        self._embedded_preview_indexes = indexes
+        self._embedded_preview_position = indexes.index(index)
+
+        item = self.items[index]
+        if self._tagger_tab_is_active():
+            checked = index in self.thumbnail_panel.tagger_selected_indexes()
+            selection_context = "tagger"
+        else:
+            checked = item.checked
+            selection_context = "edit"
+
+        if not self.embedded_preview.show_image(
+            item.image_path,
+            position=self._embedded_preview_position,
+            total=len(indexes),
+            checked=checked,
+            selection_context=selection_context,
+            take_focus=False,
+        ):
+            self._set_embedded_preview_active(False)
+
+    def _navigate_embedded_preview(self, direction: int) -> None:
+        if not self._embedded_preview_active:
+            return
+
+        current_index = (
+            self._embedded_preview_indexes[self._embedded_preview_position]
+            if (
+                self._embedded_preview_indexes
+                and 0 <= self._embedded_preview_position < len(self._embedded_preview_indexes)
+            )
+            else (
+                self._tagger_current_index
+                if self._tagger_tab_is_active()
+                else self.current_index
+            )
+        )
+
+        # 前後移動のたびに対象リストを取り直し、フィルタや表示範囲の変更へ追従する。
+        # タグ編集側は source="checked" でも visible_indexes() 全体を対象にする。
+        indexes = self._lightbox_target_indexes(self._embedded_preview_source)
+        if not indexes:
+            self._set_embedded_preview_active(False)
+            return
+
+        if current_index in indexes:
+            base_position = indexes.index(current_index)
+        else:
+            base_position = min(self._embedded_preview_position, len(indexes) - 1)
+
+        self._embedded_preview_indexes = indexes
+        self._embedded_preview_position = (base_position + direction) % len(indexes)
+        self._show_embedded_preview_current()
+
+    def _toggle_embedded_preview_current_check(self) -> None:
+        """埋め込み拡大プレビューで現在画像のチェックをSpaceで切り替える。"""
+        if self._tagger_execution_is_active():
+            return
+        if not self._embedded_preview_active or not self._embedded_preview_indexes:
+            return
+        if not (0 <= self._embedded_preview_position < len(self._embedded_preview_indexes)):
+            return
+
+        index = self._embedded_preview_indexes[self._embedded_preview_position]
+        if not (0 <= index < len(self.items)):
+            return
+
+        if self._tagger_tab_is_active():
+            was_checked = index in self.thumbnail_panel.tagger_selected_indexes()
+            self.thumbnail_panel._set_tagger_selected_indexes([index], not was_checked)
+            self._show_embedded_preview_current()
+            return
+
+        was_checked = self.items[index].checked
+        self.thumbnail_panel._set_checked_indexes([index], not was_checked)
+
+        # タグ編集側の拡大表示は、黄色チェックの有無にかかわらず
+        # 現在の表示画像全体を前後移動対象にする。Spaceでチェックを外しても
+        # 現在画像を対象リストから外したり、次画像へ自動移動したりしない。
+        next_indexes = self._lightbox_target_indexes(self._embedded_preview_source)
+        if next_indexes and index in next_indexes:
+            self._embedded_preview_indexes = next_indexes
+            self._embedded_preview_position = next_indexes.index(index)
+        self._show_embedded_preview_current()
 
     def _show_lightbox(self, path: Path, source: str = "normal") -> None:
+        """現在の既定モードで拡大表示を開く。"""
+        if self.app_settings.enlarged_preview_mode == "embedded":
+            self._show_embedded_preview(path, source)
+            return
+        self._show_lightbox_direct(path, source)
+
+    def _show_lightbox_direct(self, path: Path, source: str = "normal") -> None:
         """プレビューでクリックされた元画像を、ライトボックスで拡大表示する。"""
         index = self._index_for_image_path(path)
         if index is None:
@@ -358,15 +758,18 @@ class AppWindow(QMainWindow):
         self._hover_preview_restore_timer.stop()
         self.lightbox.setGeometry(self.centralWidget().rect())
         self._lightbox_active = True
+        self._update_base_preview_suppression()
 
         if not self._show_lightbox_current():
             self._lightbox_active = False
+            self._update_base_preview_suppression()
 
     def _on_lightbox_closed(self) -> None:
         """拡大確認を閉じ、開く前に有効だったプレビュー表示を再描画する。"""
         self._lightbox_active = False
         self._lightbox_indexes = []
         self._lightbox_position = 0
+        self._update_base_preview_suppression()
         self._hover_preview_restore_timer.stop()
         self._update_preview_placeholder_state()
 
@@ -377,13 +780,17 @@ class AppWindow(QMainWindow):
         return None
 
     def _lightbox_target_indexes(self, source: str | None = None) -> list[int]:
-        """ライトボックス前後移動の対象index列を返す。"""
+        """拡大表示の前後移動対象index列を返す。
+
+        タグ編集側は、操作対象プレビュー起点（source="checked"）でも
+        黄色チェック中だけには限定せず、現在サムネイル欄に表示されている
+        画像全体を移動対象にする。Tagger側の checked 文脈だけは従来通り
+        Tagger専用チェック中画像を対象にする。
+        """
         effective_source = source or self._lightbox_source
 
-        if effective_source == "checked":
-            if self._tagger_tab_is_active():
-                return self.thumbnail_panel.tagger_selected_indexes()
-            return self.thumbnail_panel.checked_indexes()
+        if effective_source == "checked" and self._tagger_tab_is_active():
+            return self.thumbnail_panel.tagger_selected_indexes()
 
         return self.thumbnail_panel.visible_indexes()
 
@@ -482,26 +889,10 @@ class AppWindow(QMainWindow):
         was_checked = self.items[index].checked
         self.thumbnail_panel._set_checked_indexes([index], not was_checked)
 
-        if self._lightbox_source != "checked":
-            # 通常プレビュー起点では、同じ画像を表示し続ける。
-            self._show_lightbox_current()
-            return
-
-        if was_checked:
-            # 操作対象起点でチェックを外した場合、対象リストから外れる。
-            # 旧位置を基準に、残りがあれば次の画像へ進む。
-            next_indexes = self._lightbox_target_indexes("checked")
-            if not next_indexes:
-                self.lightbox.close_overlay()
-                return
-
-            self._lightbox_indexes = next_indexes
-            self._lightbox_position = min(self._lightbox_position, len(next_indexes) - 1)
-            self._show_lightbox_current()
-            return
-
-        next_indexes = self._lightbox_target_indexes("checked")
-        if index in next_indexes:
+        # タグ編集側では、操作対象プレビュー起点でも黄色チェック中だけに限定しない。
+        # Spaceでチェック状態を変えても、同じ画像を表示し続ける。
+        next_indexes = self._lightbox_target_indexes(self._lightbox_source)
+        if next_indexes and index in next_indexes:
             self._lightbox_indexes = next_indexes
             self._lightbox_position = next_indexes.index(index)
         self._show_lightbox_current()
@@ -709,6 +1100,8 @@ class AppWindow(QMainWindow):
             return
         if self._lightbox_active:
             self.lightbox.close_overlay()
+        if self._embedded_preview_active:
+            self._set_embedded_preview_active(False)
 
         self._clear_pending_tagger_thumbnail_status_updates()
         self._checks_changed_timer.stop()
@@ -906,6 +1299,9 @@ class AppWindow(QMainWindow):
         self._update_preview_placeholder_state()
         placeholder_ms = (time.perf_counter() - placeholder_started) * 1000 if perf_enabled else 0.0
 
+        if self._embedded_preview_active and not self._embedded_preview_internal_selection:
+            self._sync_embedded_preview_to_index(index)
+
         if perf_enabled:
             log.info(
                 "[PERF] app.select_image index=%d checked_count=%d defer_checked_refresh=%s "
@@ -968,6 +1364,17 @@ class AppWindow(QMainWindow):
         self._select_first_visible_if_current_hidden()
         self._refresh_current_preview_counter()
 
+    def _navigate_from_mouse_gesture(self, direction: int) -> None:
+        """ジェスチャー成立時に、現在有効な表示モードの画像送りへ接続する。"""
+        if self._lightbox_active:
+            self._navigate_lightbox(direction)
+        elif self._embedded_preview_active:
+            self._navigate_embedded_preview(direction)
+        elif direction < 0:
+            self.select_previous()
+        else:
+            self.select_next()
+
     def select_previous(self) -> None:
         if not self.items:
             return
@@ -1026,6 +1433,14 @@ class AppWindow(QMainWindow):
         self._checked_hover_preview_active = False
         self._hover_preview_restore_timer.stop()
 
+        if self._embedded_preview_active:
+            # タブをまたいで黄色チェック/Taggerチェックの対象文脈を混在させない。
+            # タブ切替後は通常プレビュー文脈へ寄せ、select_* 側の同期で現在画像を表示する。
+            self._embedded_preview_source = "normal"
+            self._embedded_preview_indexes = self._lightbox_target_indexes("normal")
+            if not self._embedded_preview_indexes:
+                self._set_embedded_preview_active(False)
+
         if self._tagger_tab_is_active():
             self.thumbnail_panel.set_interaction_context("tagger")
             if not (0 <= self._tagger_current_index < len(self.items)) and self.items:
@@ -1068,6 +1483,9 @@ class AppWindow(QMainWindow):
         self.preview_panel.set_image(self.items[index].image_path, preview_position, preview_total)
         self.tagger_panel.set_current_index(index)
         self._refresh_tagger_current_result()
+
+        if self._embedded_preview_active and not self._embedded_preview_internal_selection:
+            self._sync_embedded_preview_to_index(index)
 
     def _install_tagger_tab(self) -> None:
         """既存TagPanel内のdanbooruタグ枠を、TaggerPanelへ置き換える。"""
@@ -2001,6 +2419,18 @@ class AppWindow(QMainWindow):
         self._update_preview_placeholder_state()
         log_user_ok("外部変更されたタグを再読み込みしました: %d件", len(items))
 
+    def open_image_folder_for_index(self, index: int) -> None:
+        """右クリックしたサムネイル画像をExplorer上で選択表示する。"""
+        if not (0 <= index < len(self.items)):
+            return
+        path = self.items[index].image_path
+        try:
+            used_method = open_folder_and_select_file(path)
+            log.info("画像フォルダを開く: %s method=%s", path, used_method)
+        except (OSError, ValueError) as exc:
+            log.warning("画像フォルダを開けませんでした: %s (%s)", path, exc)
+            QMessageBox.warning(self, "画像フォルダを開く", f"画像を選択して開けませんでした。\n{path}\n\n{exc}")
+
     def open_tag_file_for_index(self, index: int) -> None:
         """サムネイル右クリックから、対応するtxtを既定アプリで開く。"""
         if not (0 <= index < len(self.items)):
@@ -2354,7 +2784,21 @@ class AppWindow(QMainWindow):
 
         return False
 
+    def _hover_preview_cursor_near_transfer_boundary(self) -> bool:
+        """パネル間移動の短い隙間か、入場イベント未到着の隣接パネル上かを判定する。"""
+        cursor = QCursor.pos()
+        # 12pxだけ外周を広げ、イベントの届く順序が前後する領域も吸収する。
+        # 大きなサムネイル領域・画面外への移動では待機しない。
+        for panel in (self.tag_panel, self.preview_panel):
+            if panel.isVisible() and panel.rect().adjusted(-12, -12, 12, 12).contains(
+                panel.mapFromGlobal(cursor)
+            ):
+                return True
+        return False
+
     def _schedule_hover_preview_restore(self) -> None:
+        if not self._checked_hover_preview_active:
+            return
         if (
             self._tag_panel_hovered
             or self._whole_tag_panel_hovered
@@ -2363,9 +2807,15 @@ class AppWindow(QMainWindow):
         ):
             return
 
-        # タグパネル／一時プレビュー欄からサムネイル欄等へ移動する際、
-        # 境界でちらつかないよう短い猶予を置く。
-        self._hover_preview_restore_timer.start()
+        if self._hover_preview_cursor_near_transfer_boundary():
+            # タグ欄→プレビュー欄の間にある隙間を通過する間だけ猶予を残す。
+            # モーダル表示中の250msリトライでQTimerのintervalが変わっても、
+            # 通常の補助猶予は毎回70msで開始する。
+            self._hover_preview_restore_timer.start(70)
+        else:
+            # サムネイル／その他の領域へ出たなら、250msの待ちを入れずに復帰。
+            self._hover_preview_restore_timer.stop()
+            self._finish_hover_preview_if_outside()
 
     def _finish_hover_preview_if_outside(self) -> None:
         if self._lightbox_active:
@@ -2374,9 +2824,9 @@ class AppWindow(QMainWindow):
         if self._tag_panel_modal_dialog_active():
             # 追加・編集・履歴などのTagPanel配下ダイアログを開くと、
             # マウスは一時的にTagPanel外へ出た扱いになる。
-            # すでに発動中の操作対象プレビューは維持し、
-            # ダイアログが閉じた後に通常のホバー判定へ戻す。
-            self._hover_preview_restore_timer.start()
+            # すでに発動中の操作対象プレビューは維持する。
+            # モーダル中は頻繁に再確認する必要がないため、低頻度で待つ。
+            self._hover_preview_restore_timer.start(250)
             return
 
         if (

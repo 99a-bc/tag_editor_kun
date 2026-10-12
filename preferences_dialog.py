@@ -96,6 +96,18 @@ class PreferencesDialog(QDialog):
         tag_color_hint.setObjectName("DialogHint")
         tag_color_hint.setWordWrap(True)
 
+        self.tag_preset_compact_check = QCheckBox("プリセットタグを詰めて表示する")
+        self.tag_preset_compact_check.setChecked(settings.tag_preset_compact_enabled)
+        self.tag_preset_compact_check.setToolTip(
+            "ONにすると、タグプリセット画面のチェック付きタグを横方向に詰めて折り返して表示します。"
+        )
+
+        tag_preset_compact_hint = QLabel(
+            "OFFの場合は1タグ1行で表示します。設定変更後はプリセット画面へ即時反映されます。"
+        )
+        tag_preset_compact_hint.setObjectName("DialogHint")
+        tag_preset_compact_hint.setWordWrap(True)
+
         self.tag_completion_check = QCheckBox("Danbooruタグ候補を表示する")
         self.tag_completion_check.setChecked(settings.tag_completion_enabled)
         self.tag_completion_check.setToolTip(
@@ -137,10 +149,12 @@ class PreferencesDialog(QDialog):
         form_layout.addWidget(remember_recursive_hint, 3, 0, 1, 2)
         form_layout.addWidget(self.tag_color_check, 4, 0, 1, 2)
         form_layout.addWidget(tag_color_hint, 5, 0, 1, 2)
-        form_layout.addWidget(self.tag_completion_check, 6, 0, 1, 2)
-        form_layout.addWidget(self.tag_completion_limit_label, 7, 0)
-        form_layout.addWidget(self.tag_completion_limit_spin, 7, 1)
-        form_layout.addWidget(tag_completion_default_label, 8, 1)
+        form_layout.addWidget(self.tag_preset_compact_check, 6, 0, 1, 2)
+        form_layout.addWidget(tag_preset_compact_hint, 7, 0, 1, 2)
+        form_layout.addWidget(self.tag_completion_check, 8, 0, 1, 2)
+        form_layout.addWidget(self.tag_completion_limit_label, 9, 0)
+        form_layout.addWidget(self.tag_completion_limit_spin, 9, 1)
+        form_layout.addWidget(tag_completion_default_label, 10, 1)
 
         self.tag_completion_check.toggled.connect(self._update_tag_completion_controls)
         self._update_tag_completion_controls(self.tag_completion_check.isChecked())
@@ -178,6 +192,7 @@ class PreferencesDialog(QDialog):
             self._recursive_load_depth
         )
         next_settings.tag_color_enabled = self.tag_color_check.isChecked()
+        next_settings.tag_preset_compact_enabled = self.tag_preset_compact_check.isChecked()
         next_settings.tag_completion_enabled = self.tag_completion_check.isChecked()
         next_settings.tag_completion_limit = normalize_tag_completion_limit(
             self.tag_completion_limit_spin.value()

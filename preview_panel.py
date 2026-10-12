@@ -17,7 +17,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from theme import PREVIEW_IMAGE_LABEL_QSS, PREVIEW_STATUS_LABEL_QSS
+from theme import PREVIEW_IMAGE_LABEL_QSS
+from filename_status import SelectableFilenameStatus
 
 
 class ClickablePreviewLabel(QLabel):
@@ -69,6 +70,9 @@ class PreviewPanel(QFrame):
         self._gallery_current_path: Path | None = None
         self._gallery_columns: int = -1
         self._gallery_signature: tuple[tuple[Path, ...], Path | None] | None = None
+        # 拡大確認表示 / 拡大プレビュー中は、元のプレビュー内容だけを隠す。
+        # 内部状態は更新し続け、モード終了時に最新状態をそのまま復元する。
+        self._content_suppressed = False
 
         self.setObjectName("PreviewPanel")
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -120,22 +124,64 @@ class PreviewPanel(QFrame):
         self.display_stack = QStackedWidget()
         self.display_stack.setMinimumSize(520, 320)
         self.display_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.blank_page = QWidget()
+        self.blank_page.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.blank_page.setStyleSheet("background: transparent;")
         self.display_stack.addWidget(self.image_label)
         self.display_stack.addWidget(self.gallery_scroll)
-        self.display_stack.setCurrentWidget(self.image_label)
+        self.display_stack.addWidget(self.blank_page)
+        self._show_display_widget(self.image_label)
 
         center_layout = QHBoxLayout()
         center_layout.addWidget(self.prev_button)
         center_layout.addWidget(self.display_stack, 1)
         center_layout.addWidget(self.next_button)
 
-        self.status_label = QLabel(self._normal_status_text)
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setStyleSheet(PREVIEW_STATUS_LABEL_QSS)
+        self.status_label = SelectableFilenameStatus()
+        self.status_label.setObjectName("PreviewStatusBar")
+        self.status_label.setStyleSheet(
+            "QFrame#PreviewStatusBar { background: #101010; border: 1px solid #4a4a4a; "
+            "border-radius: 6px; }"
+        )
+        self.status_label.setText(self._normal_status_text)
 
         layout = QVBoxLayout(self)
         layout.addLayout(center_layout, 1)
         layout.addWidget(self.status_label)
+
+
+    def _show_display_widget(self, widget: QWidget) -> None:
+        """抑制中は空ページを維持し、それ以外では指定Widgetを表示する。"""
+        if self._content_suppressed:
+            self.display_stack.setCurrentWidget(self.blank_page)
+            return
+        self.display_stack.setCurrentWidget(widget)
+
+    def set_content_suppressed(self, suppressed: bool) -> None:
+        """
+        拡大表示中だけ、元のプレビュー欄の内容を非表示にする。
+
+        PreviewPanel自体は残すためレイアウト寸法は変えず、内部の現在画像・
+        一時プレビュー・ギャラリー状態も更新し続ける。解除時は最新状態を復元する。
+        """
+        suppressed = bool(suppressed)
+        if self._content_suppressed == suppressed:
+            return
+
+        self._content_suppressed = suppressed
+        self.prev_button.setVisible(not suppressed)
+        self.next_button.setVisible(not suppressed)
+        self.status_label.setVisible(not suppressed)
+
+        if suppressed:
+            self.display_stack.setCurrentWidget(self.blank_page)
+            return
+
+        if self._display_mode == "gallery":
+            self.display_stack.setCurrentWidget(self.gallery_scroll)
+        else:
+            self.display_stack.setCurrentWidget(self.image_label)
+            self._update_scaled_pixmap()
 
     def set_image(self, path: Path | None, index: int = 0, total: int = 0) -> None:
         """通常の青枠選択画像を保持し、通常プレビューとして表示する。"""
@@ -148,7 +194,7 @@ class PreviewPanel(QFrame):
         self._placeholder_text = None
         self._temporary_path = None
         self._temporary_pixmap = None
-        self.display_stack.setCurrentWidget(self.image_label)
+        self._show_display_widget(self.image_label)
         self.image_label.clear()
 
         if path is None:
@@ -157,16 +203,17 @@ class PreviewPanel(QFrame):
             self.status_label.setText(self._normal_status_text)
             return
 
+        # ファイル名部分だけドラッグ選択・Ctrl+C可能。残りの枚数表示は選択対象外。
+        self.status_label.set_filename_line(path.name, suffix=f"　{index}/{total}")
+
         pixmap = QPixmap(str(path))
         if pixmap.isNull():
             self._normal_message = f"画像を読み込めませんでした\n{path.name}"
             self.image_label.setText(self._normal_message)
-            self.status_label.setText(self._normal_status_text)
             return
 
         self._pixmap = pixmap
         self._update_scaled_pixmap()
-        self.status_label.setText(self._normal_status_text)
 
     def set_placeholder(self, text: str, status_text: str | None = None) -> None:
         """通常画像を保持したまま、一時的に文字表示へ切り替える。"""
@@ -174,7 +221,7 @@ class PreviewPanel(QFrame):
         self._placeholder_text = text
         self._temporary_path = None
         self._temporary_pixmap = None
-        self.display_stack.setCurrentWidget(self.image_label)
+        self._show_display_widget(self.image_label)
         self.image_label.clear()
         self.image_label.setText(text)
 
@@ -190,9 +237,14 @@ class PreviewPanel(QFrame):
         self._placeholder_text = None
         self._temporary_path = path
         self._temporary_pixmap = QPixmap(str(path))
-        self.display_stack.setCurrentWidget(self.image_label)
+        self._show_display_widget(self.image_label)
         self.image_label.clear()
-        self.status_label.setText(status_text)
+        # 一時プレビューも、ファイル名の部分だけ選択・コピーできるようにする。
+        if path.name in status_text:
+            before, after = status_text.split(path.name, 1)
+            self.status_label.set_filename_line(path.name, prefix=before, suffix=after)
+        else:
+            self.status_label.set_filename_line(path.name, prefix=status_text + "　")
 
         if self._temporary_pixmap.isNull():
             self.image_label.setText(f"画像を読み込めませんでした\n{path.name}")
@@ -230,7 +282,7 @@ class PreviewPanel(QFrame):
             self._gallery_columns = -1
             self._rebuild_gallery()
 
-        self.display_stack.setCurrentWidget(self.gallery_scroll)
+        self._show_display_widget(self.gallery_scroll)
 
         if status_text is not None:
             self.status_label.setText(status_text)
@@ -241,9 +293,15 @@ class PreviewPanel(QFrame):
         self._placeholder_text = None
         self._temporary_path = None
         self._temporary_pixmap = None
-        self.display_stack.setCurrentWidget(self.image_label)
+        self._show_display_widget(self.image_label)
         self.image_label.clear()
-        self.status_label.setText(self._normal_status_text)
+        if self._path is None:
+            self.status_label.setText(self._normal_status_text)
+        else:
+            # 元画像へ戻す際も、一時表示で選択状態やファイル名を残さない。
+            self.status_label.set_filename_line(
+                self._path.name, suffix=self._normal_status_text[len(self._path.name):]
+            )
 
         if self._pixmap is not None:
             self._update_scaled_pixmap()

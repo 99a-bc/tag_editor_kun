@@ -10,6 +10,8 @@ MIN_THUMBNAIL_WHEEL_SCROLL_PX = 20
 MAX_THUMBNAIL_WHEEL_SCROLL_PX = 600
 THUMBNAIL_WHEEL_SCROLL_STEP = 10
 DEFAULT_TAG_COLOR_ENABLED = True
+DEFAULT_TAG_PRESET_COMPACT_ENABLED = False
+DEFAULT_ENLARGED_PREVIEW_MODE = "lightbox"
 DEFAULT_TAG_COMPLETION_ENABLED = True
 DEFAULT_TAG_COMPLETION_LIMIT = 12
 MIN_TAG_COMPLETION_LIMIT = 1
@@ -27,6 +29,7 @@ DEFAULT_TAGGER_INCLUDE_COPYRIGHT = False
 DEFAULT_TAGGER_COPYRIGHT_EXPANDED = False
 DEFAULT_TAGGER_APPLY_MODE = "empty_only"
 
+_ENLARGED_PREVIEW_MODE_VALUES = {"lightbox", "embedded"}
 _TAGGER_DEVICE_VALUES = {"auto", "cpu", "gpu"}
 _TAGGER_APPLY_MODE_VALUES = {"empty_only", "overwrite", "append"}
 
@@ -95,6 +98,12 @@ def normalize_bool(value: object, *, default: bool = False) -> bool:
     return default
 
 
+def normalize_enlarged_preview_mode(value: object) -> str:
+    """拡大表示の既定モードを既知の値へ正規化する。"""
+    mode = str(value or "").strip().lower()
+    return mode if mode in _ENLARGED_PREVIEW_MODE_VALUES else DEFAULT_ENLARGED_PREVIEW_MODE
+
+
 def normalize_tagger_model_repo(value: object) -> str:
     """TaggerモデルのリポジトリIDを安全な既定値へ寄せる。"""
     model_repo = str(value or "").strip()
@@ -129,6 +138,8 @@ class AppSettings:
     recursive_load_enabled: bool = False
     recursive_load_depth: int = DEFAULT_RECURSIVE_LOAD_DEPTH
     tag_color_enabled: bool = DEFAULT_TAG_COLOR_ENABLED
+    tag_preset_compact_enabled: bool = DEFAULT_TAG_PRESET_COMPACT_ENABLED
+    enlarged_preview_mode: str = DEFAULT_ENLARGED_PREVIEW_MODE
     tag_completion_enabled: bool = DEFAULT_TAG_COMPLETION_ENABLED
     tag_completion_limit: int = DEFAULT_TAG_COMPLETION_LIMIT
     tagger_model_repo: str = DEFAULT_TAGGER_MODEL_REPO
@@ -161,6 +172,13 @@ class AppSettings:
             tag_color_enabled=normalize_bool(
                 data.get("tag_color_enabled"),
                 default=DEFAULT_TAG_COLOR_ENABLED,
+            ),
+            tag_preset_compact_enabled=normalize_bool(
+                data.get("tag_preset_compact_enabled"),
+                default=DEFAULT_TAG_PRESET_COMPACT_ENABLED,
+            ),
+            enlarged_preview_mode=normalize_enlarged_preview_mode(
+                data.get("enlarged_preview_mode")
             ),
             tag_completion_enabled=normalize_bool(
                 data.get("tag_completion_enabled"),
@@ -213,6 +231,10 @@ class AppSettings:
                 self.recursive_load_depth
             ),
             "tag_color_enabled": bool(self.tag_color_enabled),
+            "tag_preset_compact_enabled": bool(self.tag_preset_compact_enabled),
+            "enlarged_preview_mode": normalize_enlarged_preview_mode(
+                self.enlarged_preview_mode
+            ),
             "tag_completion_enabled": bool(self.tag_completion_enabled),
             "tag_completion_limit": normalize_tag_completion_limit(
                 self.tag_completion_limit

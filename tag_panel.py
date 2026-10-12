@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+from typing import Callable
 import time
 from urllib.parse import quote_plus
 
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QGridLayout,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionButton,
     QStylePainter,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -68,7 +71,16 @@ from tag_completion import TagCompletionController
 from settings import (
     DEFAULT_TAG_COMPLETION_ENABLED,
     DEFAULT_TAG_COMPLETION_LIMIT,
+    load_app_settings,
     normalize_tag_completion_limit,
+)
+from tag_presets import (
+    TagPresetEntry,
+    TagPresetState,
+    TAG_PRESET_SLOTS_PER_TAB,
+    TAG_PRESET_TAB_COUNT,
+    load_tag_preset_state,
+    save_tag_preset_state,
 )
 from tag_color_dictionary import (
     TagColorDictionary,
@@ -700,7 +712,7 @@ class AllTagChip(QFrame):
                 padding: 0px;
             }}
             QPushButton:hover {{
-                background: rgba(34, 197, 94, 0.10);
+                background: rgba(34, 197, 94, 0.28);
             }}
             QPushButton:checked {{
                 color: #8dffae;
@@ -734,7 +746,7 @@ class AllTagChip(QFrame):
                 padding: 0px;
             }}
             QPushButton:hover {{
-                background: rgba(239, 68, 68, 0.10);
+                background: rgba(239, 68, 68, 0.28);
             }}
             QPushButton:checked {{
                 color: #ff9a9a;
@@ -1274,6 +1286,1319 @@ class AddTagDialog(QDialog):
 
         if tag:
             self.warning_label.setText("")
+
+class PresetEditTagChip(TagChip):
+    """プリセット編集用。通常タグチップに削除×だけを足したドラッグ可能チップ。"""
+
+    remove_requested = Signal(str)
+
+    def __init__(self, tag: str) -> None:
+        super().__init__(tag)
+        self.tag_button.setCheckable(False)
+        self.set_drag_enabled(True)
+
+        remove_button = QPushButton("×")
+        remove_button.setToolTip(f"「{tag}」をプリセットから削除")
+        remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        remove_button.setFixedSize(22, 22)
+        remove_button.setStyleSheet(
+            """
+            QPushButton {
+                color: #d7e2ee;
+                background: #1a2029;
+                border: 1px solid #465463;
+                border-radius: 8px;
+                font-size: 15px;
+                font-weight: bold;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                color: #ffffff;
+                background: #69303a;
+                border-color: #e06a7c;
+            }
+            QPushButton:pressed {
+                color: #ffffff;
+                background: #4e252d;
+                border-color: #ff8ca0;
+            }
+            """
+        )
+        remove_button.clicked.connect(lambda: self.remove_requested.emit(self.tag))
+
+        layout = self.layout()
+        if isinstance(layout, QHBoxLayout):
+            layout.addWidget(remove_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.remove_button = remove_button
+        self.sync_content_width()
+        self._schedule_content_width_sync()
+
+
+
+class PresetTagSearchBar(QFrame):
+    """プリセット表示/編集で共用する検索バー。compactはサムネイル検索型。"""
+
+    def __init__(self, *, compact: bool = False) -> None:
+        super().__init__()
+        self.setObjectName("TagSearchBar")
+        self.setStyleSheet(TAG_SEARCH_BAR_QSS)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Fixed if compact else QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        if compact:
+            # パンくず・全選択/全解除と同居できるよう横幅を抑える。
+            self.setFixedSize(154, 34)
+        else:
+            self.setFixedHeight(37)
+            self.setMinimumWidth(320)
+
+        self.line = QLineEdit()
+        self.line.setPlaceholderText("タグ検索")
+        self.line.setToolTip("登録タグのみをハイライトします。タグの順序やチェックは変えません。")
+        self.line.setClearButtonEnabled(False)
+        self.line.setFixedHeight(20 if compact else 25)
+        if compact:
+            # 共通TAG_SEARCH_BAR_QSSのQLineEditには上下6pxのpaddingがある。
+            # 20pxの小型入力欄では文字が縦に切れるため、このインスタンスだけ
+            # 内側余白を上書きする（通常サイズの検索欄は従来スタイルを維持）。
+            self.line.setStyleSheet(
+                "QLineEdit { padding: 0px 5px; font-size: 11px; }"
+            )
+            self.line.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
+        self.exact_check = QCheckBox("完全一致")
+        self.exact_check.setToolTip("タグ名全体が検索語と一致する場合のみ検索します。")
+        self.exact_check.setStyleSheet(
+            "QCheckBox { color: #e8e8e8; spacing: 1px; font-size: 9px; } "
+            "QCheckBox::indicator { width: 10px; height: 10px; }"
+            if compact else
+            "QCheckBox { color: #e8e8e8; spacing: 3px; font-size: 10px; } "
+            "QCheckBox::indicator { width: 12px; height: 12px; }"
+        )
+        self.count_label = QLabel("")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.count_label.setStyleSheet("color: #ffe58a; font-size: 9px; font-weight: bold;")
+
+        self.prev_button = QPushButton("＜")
+        self.next_button = QPushButton("＞")
+        self.clear_button = QPushButton("×")
+        self.prev_button.setToolTip("前の一致タグ")
+        self.next_button.setToolTip("次の一致タグ")
+        self.clear_button.setToolTip("検索をクリア")
+        for button in (self.prev_button, self.next_button, self.clear_button):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if compact:
+                button.setFixedSize(16, 15)
+                button.setStyleSheet("QPushButton { padding: 0px; font-size: 10px; }")
+            else:
+                button.setFixedWidth(30)
+
+        if compact:
+            info = QVBoxLayout()
+            info.setContentsMargins(0, 0, 0, 0)
+            info.setSpacing(0)
+            info.addWidget(self.exact_check, 0, Qt.AlignmentFlag.AlignCenter)
+            buttons = QHBoxLayout()
+            buttons.setContentsMargins(0, 0, 0, 0)
+            buttons.setSpacing(1)
+            for button in (self.prev_button, self.next_button, self.clear_button):
+                buttons.addWidget(button)
+            info.addLayout(buttons)
+            self.count_label.setFixedHeight(11)
+            text_column = QVBoxLayout()
+            text_column.setContentsMargins(0, 0, 0, 0)
+            text_column.setSpacing(0)
+            text_column.addWidget(self.line)
+            text_column.addWidget(self.count_label)
+            row = QHBoxLayout(self)
+            row.setContentsMargins(4, 1, 4, 1)
+            row.setSpacing(3)
+            row.addLayout(text_column, 1)
+            row.addLayout(info)
+        else:
+            info = QVBoxLayout()
+            info.setContentsMargins(0, 0, 0, 0)
+            info.setSpacing(0)
+            info.addWidget(self.exact_check)
+            info.addWidget(self.count_label)
+            self.count_label.setFixedWidth(70)
+            row = QHBoxLayout(self)
+            row.setContentsMargins(5, 3, 5, 3)
+            row.setSpacing(4)
+            row.addWidget(self.line, 1)
+            row.addLayout(info)
+            row.addWidget(self.prev_button)
+            row.addWidget(self.next_button)
+            row.addWidget(self.clear_button)
+
+        self.set_match_state(0, -1)
+
+    def set_match_state(self, match_count: int, current_index: int) -> None:
+        if not self.line.text().strip():
+            self.count_label.setText("")
+        elif not match_count:
+            self.count_label.setText("結果なし")
+        else:
+            self.count_label.setText(f"{current_index + 1} / {match_count}")
+        self.prev_button.setEnabled(match_count > 0)
+        self.next_button.setEnabled(match_count > 0)
+        self.clear_button.setEnabled(bool(self.line.text()))
+
+
+class PresetTagSearchController:
+    """現在のプリセット内だけを検索。表示タグのハイライトとスクロールを管理。"""
+
+    def __init__(
+        self,
+        bar: PresetTagSearchBar,
+        get_chips: Callable[[], list[tuple[str, SearchHighlightButton]]],
+        get_scroll_area: Callable[[], QScrollArea],
+    ) -> None:
+        self.bar = bar
+        self._get_chips = get_chips
+        self._get_scroll_area = get_scroll_area
+        self._matches: list[str] = []
+        self._current_tag: str | None = None
+        bar.line.textChanged.connect(lambda _text: self.refresh(reset_to_first=True, scroll=True))
+        bar.line.returnPressed.connect(lambda: self.jump(1))
+        bar.exact_check.toggled.connect(lambda _checked: self.refresh(reset_to_first=True, scroll=True))
+        bar.prev_button.clicked.connect(lambda: self.jump(-1))
+        bar.next_button.clicked.connect(lambda: self.jump(1))
+        bar.clear_button.clicked.connect(bar.line.clear)
+
+    def refresh(self, *, reset_to_first: bool = False, scroll: bool = False) -> None:
+        query = self.bar.line.text().strip()
+        normalized_query = " ".join(query.casefold().replace("_", " ").split())
+        chips = self._get_chips()
+        exact = self.bar.exact_check.isChecked()
+        self._matches = [
+            tag for tag, _button in chips
+            if normalized_query and (
+                " ".join(tag.casefold().replace("_", " ").split()) == normalized_query
+                if exact else
+                normalized_query in " ".join(tag.casefold().replace("_", " ").split())
+            )
+        ]
+        if not self._matches:
+            self._current_tag = None
+        elif reset_to_first or self._current_tag not in self._matches:
+            self._current_tag = self._matches[0]
+        match_set = set(self._matches)
+        for tag, button in chips:
+            button.set_search_marker(
+                query if tag in match_set else "",
+                current=(tag == self._current_tag),
+                exact_match=exact and tag in match_set,
+            )
+        index = self._matches.index(self._current_tag) if self._current_tag in self._matches else -1
+        self.bar.set_match_state(len(self._matches), index)
+        if scroll and self._current_tag is not None:
+            self._schedule_scroll()
+
+    def jump(self, direction: int) -> None:
+        if not self._matches:
+            return
+        current = self._matches.index(self._current_tag) if self._current_tag in self._matches else -1
+        self._current_tag = self._matches[(current + direction) % len(self._matches)]
+        self.refresh(scroll=True)
+
+    def _schedule_scroll(self) -> None:
+        # ChipWrapAreaはイベントループで並べ替えられるため、レイアウト確定後にも追従。
+        QTimer.singleShot(0, self._scroll_to_current)
+        QTimer.singleShot(35, self._scroll_to_current)
+
+    def _scroll_to_current(self) -> None:
+        if self._current_tag is None:
+            return
+        for tag, button in self._get_chips():
+            if tag == self._current_tag:
+                scroll = self._get_scroll_area()
+                if scroll.isVisible():
+                    scroll.ensureWidgetVisible(button, 12, 12)
+                return
+
+
+class TagPresetEditDialog(QDialog):
+    """タグプリセットの名前・登録タグ・並び順を編集するモーダルダイアログ。"""
+
+    def __init__(
+        self,
+        *,
+        preset_name: str,
+        preset_entries: list[TagPresetEntry],
+        default_name: str,
+        parent: QWidget | None = None,
+        tag_dictionary: DanbooruTagDictionary | None = None,
+        tag_color_dictionary: TagColorDictionary | None = None,
+        tag_color_enabled: bool = True,
+        tag_qss_provider: Callable[[str], str | None] | None = None,
+        tag_completion_enabled: bool = DEFAULT_TAG_COMPLETION_ENABLED,
+        tag_completion_limit: int = DEFAULT_TAG_COMPLETION_LIMIT,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("プリセット編集")
+        self.setModal(True)
+        self.setMinimumSize(620, 620)
+        self.resize(700, 720)
+        self.setStyleSheet(ADD_TAG_DIALOG_QSS)
+
+        self._default_name = default_name
+        self._entries = [
+            TagPresetEntry(
+                text=entry.text,
+                checked=bool(entry.checked),
+                metadata=dict(entry.metadata),
+            )
+            for entry in preset_entries
+        ]
+        self._reset_requested = False
+        self._tag_color_dictionary = tag_color_dictionary
+        self._tag_color_enabled = bool(tag_color_enabled)
+        self._tag_qss_provider = tag_qss_provider
+        self._tag_completion_enabled = bool(tag_completion_enabled)
+        self._tag_completion_limit = normalize_tag_completion_limit(tag_completion_limit)
+
+        card = QFrame()
+        card.setObjectName("DialogCard")
+
+        title_label = QLabel("プリセット編集")
+        title_label.setObjectName("DialogTitle")
+
+        name_label = QLabel("プリセット名")
+        name_label.setObjectName("DialogHint")
+        self.name_line = QLineEdit(preset_name)
+        self.name_line.setPlaceholderText(default_name)
+
+        add_label = QLabel("タグを追加")
+        add_label.setObjectName("DialogHint")
+        self.input_line = QLineEdit()
+        self.input_line.setPlaceholderText("例: white gloves, black shorts, baton holster")
+        self.input_line.returnPressed.connect(self._add_input_tags)
+
+        self._tag_completion = TagCompletionController(
+            self.input_line,
+            tag_dictionary if self._tag_completion_enabled else None,
+            tag_color_dictionary=tag_color_dictionary,
+            tag_color_enabled=tag_color_enabled,
+            limit=self._tag_completion_limit,
+        )
+
+        add_button = QPushButton("追加")
+        add_button.clicked.connect(self._add_input_tags)
+        add_row = QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
+        add_row.setSpacing(6)
+        add_row.addWidget(self.input_line, 1)
+        add_row.addWidget(add_button)
+
+        hint = QLabel("複数タグはカンマ区切りで入力できます。登録済みタグは重複追加しません。")
+        hint.setObjectName("DialogHint")
+        hint.setWordWrap(True)
+
+        self.dictionary_status_label = QLabel("")
+        self.dictionary_status_label.setObjectName("DialogHint")
+        self.dictionary_status_label.setStyleSheet("color: #e7ba66;")
+        if self._tag_completion_enabled and not self._tag_completion.is_available():
+            status_text = (
+                tag_dictionary.status_message()
+                if tag_dictionary is not None
+                else "Danbooru補完辞書を利用できません。"
+            )
+            self.dictionary_status_label.setText(status_text)
+            self.dictionary_status_label.setWordWrap(True)
+
+        registered_label = QLabel("登録タグ")
+        registered_label.setObjectName("DialogHint")
+        # 「登録タグ」と同じ行の右側に、通常タグパネルと同等の検索欄を置く。
+        self.preset_search_bar = PresetTagSearchBar(compact=False)
+        registered_row = QHBoxLayout()
+        registered_row.setContentsMargins(0, 0, 0, 0)
+        registered_row.setSpacing(6)
+        registered_row.addWidget(registered_label)
+        registered_row.addStretch(1)
+        registered_row.addWidget(self.preset_search_bar, 0)
+
+        # 登録タグは通常タグ一覧と同じ折り返し領域を使い、
+        # タグ本体のドラッグ&ドロップで順序変更する。
+        self.tag_scroll = ChipWrapArea()
+        self.tag_scroll.setMinimumHeight(280)
+        self.tag_scroll.set_tag_reorder_enabled(True)
+        self.tag_scroll.tag_reorder_requested.connect(self._reorder_entry)
+
+        reset_button = QPushButton("プリセットを初期化")
+        reset_button.setToolTip("名前・登録タグ・チェック状態を初期状態へ戻します")
+        reset_button.clicked.connect(self._request_reset)
+        reset_button.setStyleSheet(
+            "QPushButton { color: #ffb0b0; } QPushButton:hover { color: #ffd0d0; }"
+        )
+
+        save_button = QPushButton("保存")
+        cancel_button = QPushButton("取消")
+        save_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(reset_button)
+        button_layout.addStretch(1)
+        button_layout.addWidget(save_button)
+        button_layout.addSpacing(18)
+        button_layout.addWidget(cancel_button)
+
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 16, 18, 16)
+        card_layout.setSpacing(10)
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(name_label)
+        card_layout.addWidget(self.name_line)
+        card_layout.addWidget(add_label)
+        card_layout.addLayout(add_row)
+        card_layout.addWidget(hint)
+        if self.dictionary_status_label.text():
+            card_layout.addWidget(self.dictionary_status_label)
+        card_layout.addLayout(registered_row)
+        card_layout.addWidget(self.tag_scroll, 1)
+        card_layout.addLayout(button_layout)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(card)
+
+        self._search_chips: list[tuple[str, SearchHighlightButton]] = []
+        self._preset_search = PresetTagSearchController(
+            self.preset_search_bar,
+            lambda: self._search_chips,
+            lambda: self.tag_scroll,
+        )
+        self._refresh_tag_rows()
+
+    def preset_name(self) -> str:
+        return self.name_line.text().strip() or self._default_name
+
+    def entries(self) -> list[TagPresetEntry]:
+        return [
+            TagPresetEntry(
+                text=entry.text,
+                checked=bool(entry.checked),
+                metadata=dict(entry.metadata),
+            )
+            for entry in self._entries
+        ]
+
+    def reset_requested(self) -> bool:
+        return self._reset_requested
+
+    def accept(self) -> None:
+        if not self._reset_requested:
+            self._add_input_tags()
+        super().accept()
+
+    def done(self, result: int) -> None:
+        self._tag_completion.dispose()
+        super().done(result)
+
+    def _add_input_tags(self) -> None:
+        raw_tags = parse_tags(self.input_line.text())
+        if not raw_tags:
+            return
+
+        existing = {entry.text for entry in self._entries}
+        changed = False
+        for tag in raw_tags:
+            tag = tag.strip()
+            if not tag or tag in existing:
+                continue
+            self._entries.append(TagPresetEntry(text=tag, checked=True))
+            existing.add(tag)
+            changed = True
+
+        self.input_line.clear()
+        self._tag_completion.hide_popup()
+        if changed:
+            self._refresh_tag_rows()
+
+    def _request_reset(self) -> None:
+        result = QMessageBox.question(
+            self,
+            "プリセットを初期化",
+            "このプリセットの名前・登録タグ・チェック状態を初期状態へ戻します。\n\nよろしいですか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+
+        self._reset_requested = True
+        self.name_line.setText(self._default_name)
+        self._entries.clear()
+        self.input_line.clear()
+        super().accept()
+
+    def _refresh_tag_rows(self) -> None:
+        self._search_chips.clear()
+        if not self._entries:
+            empty = QLabel("登録タグなし")
+            empty.setStyleSheet("color: #999999; padding: 8px;")
+            self.tag_scroll.set_chips([empty])
+            self._preset_search.refresh()
+            return
+
+        chips: list[QWidget] = []
+        for entry in self._entries:
+            chip = PresetEditTagChip(entry.text)
+            chip.set_category_style(self._tag_chip_qss(entry.text))
+            chip.remove_requested.connect(self._remove_entry_by_tag)
+            chips.append(chip)
+            self._search_chips.append((entry.text, chip.tag_button))
+
+        self.tag_scroll.set_chips(chips)
+        self.tag_scroll.set_tag_reorder_enabled(True)
+        self._preset_search.refresh()
+
+    def _reorder_entry(self, moved_tag: str, insert_index: int) -> None:
+        if not self._entries:
+            return
+
+        old_index = next(
+            (index for index, entry in enumerate(self._entries) if entry.text == moved_tag),
+            -1,
+        )
+        if old_index < 0:
+            return
+
+        moved_entry = self._entries[old_index]
+        remaining = [
+            entry
+            for index, entry in enumerate(self._entries)
+            if index != old_index
+        ]
+
+        target_index = max(0, min(int(insert_index), len(self._entries)))
+        if target_index > old_index:
+            target_index -= 1
+        target_index = max(0, min(target_index, len(remaining)))
+
+        if target_index == old_index:
+            return
+
+        remaining.insert(target_index, moved_entry)
+        self._entries = remaining
+        self._refresh_tag_rows()
+
+    def _remove_entry_by_tag(self, tag: str) -> None:
+        next_entries = [entry for entry in self._entries if entry.text != tag]
+        if len(next_entries) == len(self._entries):
+            return
+        self._entries = next_entries
+        self._refresh_tag_rows()
+
+    def _tag_chip_qss(self, tag: str) -> str:
+        # 左側タグ欄と完全に同じ判定経路を優先する。
+        if self._tag_qss_provider is not None:
+            return self._tag_qss_provider(tag) or TAG_CHIP_QSS
+        if self._tag_color_enabled and self._tag_color_dictionary is not None:
+            style = self._tag_color_dictionary.style_for_tag(tag)
+            return tag_chip_qss(style) or TAG_CHIP_QSS
+        return TAG_CHIP_QSS
+
+
+class PresetCheckTagWidget(QFrame):
+    """プリセット適用欄の「チェック + タグ」を1つの色付きユニットとして表示する。"""
+
+    context_menu_requested = Signal(str, QPoint)
+
+    def __init__(
+        self,
+        tag: str,
+        checked: bool,
+        *,
+        frame_qss: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.tag = tag
+        self.setObjectName("PresetCheckTagUnit")
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet(frame_qss)
+
+        # Qt標準QCheckBoxのチェック記号はテーマ依存で細く見えるため、
+        # チェック可能な小ボタンとして描き、ON時は太めの緑色✓を表示する。
+        self.checkbox = QPushButton()
+        self.checkbox.setObjectName("PresetCheckIndicator")
+        self.checkbox.setCheckable(True)
+        self.checkbox.setChecked(bool(checked))
+        self.checkbox.setFixedSize(18, 18)
+        self.checkbox.setToolTip("このタグを反映対象に含める")
+        self.checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.checkbox.toggled.connect(self._sync_check_mark)
+        self._sync_check_mark(self.checkbox.isChecked())
+
+        self.tag_button = SearchHighlightButton(shorten_text(tag, 44))
+        self.tag_button.setObjectName("PresetTagToggleButton")
+        self.tag_button.setToolTip(tag)
+        self.tag_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tag_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.tag_button.clicked.connect(lambda _checked=False: self.checkbox.toggle())
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 3, 0)
+        # チェックとタグは同じユニットなので、視覚的にほぼ連続する程度まで詰める。
+        layout.setSpacing(1)
+        layout.addWidget(self.checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.tag_button, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        # 通常タグと同じ右クリックメニューを使えるよう、ユニット全体と子Widgetの
+        # どこを右クリックしても同じタグを通知する。
+        self._install_context_menu(self)
+        self._install_context_menu(self.checkbox)
+        self._install_context_menu(self.tag_button)
+
+        # QSSの確定後に内容幅へ合わせる。
+        self.ensurePolished()
+        self.checkbox.ensurePolished()
+        self.tag_button.ensurePolished()
+        layout.invalidate()
+        layout.activate()
+        self.adjustSize()
+
+    def _sync_check_mark(self, checked: bool) -> None:
+        self.checkbox.setText("✓" if checked else "")
+
+    def _install_context_menu(self, widget: QWidget) -> None:
+        widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        widget.customContextMenuRequested.connect(
+            lambda pos, source=widget: self.context_menu_requested.emit(
+                self.tag,
+                source.mapToGlobal(pos),
+            )
+        )
+
+
+
+class ElidedPresetTabBar(QTabBar):
+    """4タブを必ず均等幅に収め、正式名称だけツールチップへ残す。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_tab_names: list[str] = []
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self.setExpanding(True)
+        self.setUsesScrollButtons(False)
+        self.setElideMode(Qt.TextElideMode.ElideRight)
+
+    def add_named_tab(self, name: str) -> None:
+        self._full_tab_names.append(name)
+        index = self.addTab("")
+        self.setTabToolTip(index, f"{name}\n左クリック: 切替 / 右クリック: 名前変更")
+        self._elide_names()
+
+    def set_full_tab_name(self, index: int, name: str) -> None:
+        if not (0 <= index < len(self._full_tab_names)):
+            return
+        self._full_tab_names[index] = name
+        self.setTabToolTip(index, f"{name}\n左クリック: 切替 / 右クリック: 名前変更")
+        self._elide_names()
+
+    def tabSizeHint(self, index: int) -> QSize:  # noqa: N802
+        hint = super().tabSizeHint(index)
+        count = max(1, self.count())
+        # 元の長い文字列をsizeHintへ反映させず、4件で常に横幅を等分する。
+        hint.setWidth(max(1, (self.width() - (count - 1) * 2) // count))
+        return hint
+
+    def minimumTabSizeHint(self, index: int) -> QSize:  # noqa: N802
+        return self.tabSizeHint(index)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide_names()
+
+    def _elide_names(self) -> None:
+        count = max(1, self.count())
+        # QSSの左右padding・border分は文字の割当幅から控除する。
+        tab_width = max(1, (self.width() - (count - 1) * 2) // count)
+        text_width = max(1, tab_width - 16)
+        metrics = self.fontMetrics()
+        for index, full_name in enumerate(self._full_tab_names):
+            displayed = metrics.elidedText(full_name, Qt.TextElideMode.ElideRight, text_width)
+            if self.tabText(index) != displayed:
+                self.setTabText(index, displayed)
+
+
+class ElidedPresetSlotButton(QPushButton):
+    """プリセット名が長くても、2列グリッドの幅を広げないボタン。"""
+
+    def __init__(self, name: str, parent: QWidget | None = None) -> None:
+        super().__init__("", parent)
+        self._full_name = name
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self._elide_name()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide_name()
+
+    def _elide_name(self) -> None:
+        # プリセットボタンのQSS: 左右padding 6px + border 1pxずつ。
+        text_width = max(1, self.width() - 18)
+        displayed = self.fontMetrics().elidedText(
+            self._full_name, Qt.TextElideMode.ElideRight, text_width
+        )
+        if self.text() != displayed:
+            self.setText(displayed)
+
+
+class TagPresetTabRenameDialog(QDialog):
+    """タブ名だけを変更する、既存テーマに合わせた小型ダイアログ。"""
+
+    def __init__(self, name: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("プリセットタブ名の変更")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        self.setStyleSheet(ADD_TAG_DIALOG_QSS)
+
+        card = QFrame()
+        card.setObjectName("DialogCard")
+        title = QLabel("タブ名の変更")
+        title.setObjectName("DialogTitle")
+        hint = QLabel("タブ名")
+        hint.setObjectName("DialogHint")
+        self.name_line = QLineEdit(name)
+        self.name_line.selectAll()
+        self.name_line.returnPressed.connect(self._accept_valid_name)
+
+        save_button = QPushButton("保存")
+        cancel_button = QPushButton("取消")
+        save_button.clicked.connect(self._accept_valid_name)
+        cancel_button.clicked.connect(self.reject)
+        self.name_line.textChanged.connect(
+            lambda text: save_button.setEnabled(bool(text.strip()))
+        )
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(save_button)
+        actions.addSpacing(14)
+        actions.addWidget(cancel_button)
+
+        content = QVBoxLayout(card)
+        content.setContentsMargins(18, 16, 18, 16)
+        content.setSpacing(10)
+        content.addWidget(title)
+        content.addWidget(hint)
+        content.addWidget(self.name_line)
+        content.addLayout(actions)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(card)
+
+    def tab_name(self) -> str:
+        return self.name_line.text().strip()
+
+    def _accept_valid_name(self) -> None:
+        if self.tab_name():
+            self.accept()
+
+
+class TagPresetPanel(QFrame):
+    """初期位置は右側タグ欄。タイトルドラッグで移動できる非モーダルプリセットパネル。"""
+
+    apply_requested = Signal(object, str)
+    close_requested = Signal()
+    edit_requested = Signal(int)
+    rename_tab_requested = Signal(int)
+    state_changed = Signal()
+    position_changed = Signal(object)
+    tag_context_menu_requested = Signal(str, QPoint)
+
+    def __init__(
+        self,
+        state: TagPresetState,
+        parent: QWidget | None = None,
+        *,
+        tag_color_dictionary: TagColorDictionary | None = None,
+        tag_color_enabled: bool = True,
+        tag_qss_provider: Callable[[str], str | None] | None = None,
+        compact_tags: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._state = state
+        self._state.ensure_minimum_slots()
+        self._tag_color_dictionary = tag_color_dictionary
+        self._tag_color_enabled = bool(tag_color_enabled)
+        self._tag_qss_provider = tag_qss_provider
+        self._compact_tags = bool(compact_tags)
+        self._preset_buttons: list[QPushButton] = []
+        self._checkboxes: list[QPushButton] = []
+        self._title_drag_offset: QPoint | None = None
+
+        self.setObjectName("TagPresetPanel")
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setStyleSheet(
+            """
+            QFrame#TagPresetPanel {
+                background: #14181e;
+                border: 1px solid #3c4b5b;
+                border-radius: 7px;
+            }
+            QLabel#TagPresetPanelTitle {
+                color: #dfeeff;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 2px 6px;
+            }
+            QLabel#TagPresetPanelTitle:hover {
+                background: #1d2630;
+                border-radius: 4px;
+            }
+            QTabBar#TagPresetTabBar::tab {
+                color: #e3ebf4;
+                background: #242c36;
+                border: 1px solid #465462;
+                border-bottom: 0px;
+                border-top-left-radius: 7px;
+                border-top-right-radius: 7px;
+                padding: 5px 3px;
+                margin-right: 2px;
+                min-width: 0px;
+            }
+            QTabBar#TagPresetTabBar::tab:hover {
+                background: #2c3946;
+                border-color: #718398;
+            }
+            QTabBar#TagPresetTabBar::tab:selected {
+                color: #ffffff;
+                background: #314e65;
+                border: 1px solid #669bc2;
+                border-bottom: 0px;
+                font-weight: bold;
+            }
+            QLabel#TagPresetBreadcrumbTab {
+                color: #aebfd0;
+                background: transparent;
+                border: none;
+            }
+            QLabel#TagPresetBreadcrumbSeparator {
+                color: #70869b;
+                background: transparent;
+                border: none;
+            }
+            QLabel#TagPresetBreadcrumbPreset {
+                color: #f0f6ff;
+                background: transparent;
+                border: none;
+                font-weight: bold;
+            }
+            QWidget#TagPresetBreadcrumbBar {
+                background: transparent;
+                border: none;
+                border-radius: 0px;
+            }
+            QPushButton#TagPresetSlotButton {
+                color: #e8e8e8;
+                background: #232a33;
+                border: 1px solid #465463;
+                border-radius: 6px;
+                padding: 5px 6px;
+            }
+            QPushButton#TagPresetSlotButton:hover {
+                background: #2e3945;
+                border-color: #64788c;
+            }
+            QPushButton#TagPresetSlotButton:checked {
+                color: #ffffff;
+                background: #315872;
+                border: 1px solid #72a7c9;
+                font-weight: bold;
+            }
+            """
+        )
+
+        self.title_label = QLabel("タグプリセット")
+        self.title_label.setObjectName("TagPresetPanelTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.title_label.setToolTip("ドラッグしてプリセットパネルを移動できます")
+        self.title_label.installEventFilter(self)
+
+        # 4タブ×8件。QTabBarは既存の「タグ編集 / Tagger」と同じ
+        # 上角のみ丸いタブ形状にでき、タブ全体の縦幅も抑えられる。
+        self.tab_bar = ElidedPresetTabBar()
+        self.tab_bar.setObjectName("TagPresetTabBar")
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.setFixedHeight(30)
+        for tab_index in range(TAG_PRESET_TAB_COUNT):
+            name = self._state.tab_names[tab_index]
+            self.tab_bar.add_named_tab(name)
+        self.tab_bar.setCurrentIndex(self._state.selected_tab_index)
+        self.tab_bar.currentChanged.connect(self._on_tab_changed)
+        self.tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tab_bar.customContextMenuRequested.connect(self._on_tab_context_menu)
+
+        self.slot_grid = QGridLayout()
+        self.slot_grid.setContentsMargins(0, 0, 0, 0)
+        self.slot_grid.setHorizontalSpacing(5)
+        self.slot_grid.setVerticalSpacing(5)
+        self.slot_grid.setColumnStretch(0, 1)
+        self.slot_grid.setColumnStretch(1, 1)
+
+        # 左側タグ欄に操作対象が常時表示されるため、プリセット内では重複表示しない。
+        # 選択中プリセットのパンくずと「全選択 / 全解除」を同じ1行に収める。
+        # 登録タグ一覧のスクロール領域には含めない。
+        target_row = QHBoxLayout()
+        target_row.setContentsMargins(0, 0, 0, 0)
+        target_row.setSpacing(6)
+        select_all_button = QPushButton("全選択")
+        clear_all_button = QPushButton("全解除")
+        select_all_button.clicked.connect(lambda: self._set_all_checked(True))
+        clear_all_button.clicked.connect(lambda: self._set_all_checked(False))
+
+        self.breadcrumb_bar = QWidget()
+        self.breadcrumb_bar.setObjectName("TagPresetBreadcrumbBar")
+        self.breadcrumb_bar.setFixedHeight(25)
+        # 非常に長いタブ/プリセット名でも右側のボタンを押し出さない。
+        self.breadcrumb_bar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.breadcrumb_bar.installEventFilter(self)
+        breadcrumb_row = QHBoxLayout(self.breadcrumb_bar)
+        breadcrumb_row.setContentsMargins(3, 0, 3, 0)
+        breadcrumb_row.setSpacing(8)
+        self.breadcrumb_tab_label = QLabel()
+        self.breadcrumb_tab_label.setObjectName("TagPresetBreadcrumbTab")
+        self.breadcrumb_separator_label = QLabel("›")
+        self.breadcrumb_separator_label.setObjectName("TagPresetBreadcrumbSeparator")
+        self.breadcrumb_preset_label = QLabel()
+        self.breadcrumb_preset_label.setObjectName("TagPresetBreadcrumbPreset")
+        for label in (self.breadcrumb_tab_label, self.breadcrumb_preset_label):
+            label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        breadcrumb_row.addWidget(self.breadcrumb_tab_label)
+        breadcrumb_row.addWidget(self.breadcrumb_separator_label)
+        breadcrumb_row.addWidget(self.breadcrumb_preset_label)
+        breadcrumb_row.addStretch(1)
+        target_row.addWidget(self.breadcrumb_bar, 1)
+        # サムネイル検索と同じ小型2段配置をパンくずとボタンの間へ置く。
+        self.preset_search_bar = PresetTagSearchBar(compact=True)
+        target_row.addWidget(self.preset_search_bar)
+        target_row.addWidget(select_all_button)
+        target_row.addWidget(clear_all_button)
+
+        # OFF: 従来どおり1タグ1行。
+        self.tag_list_scroll = QScrollArea()
+        self.tag_list_scroll.setWidgetResizable(True)
+        self.tag_list_scroll.setStyleSheet(CHIP_SCROLL_QSS)
+        self.tag_list_content = QWidget()
+        self.tag_list_layout = QVBoxLayout(self.tag_list_content)
+        self.tag_list_layout.setContentsMargins(6, 6, 6, 6)
+        self.tag_list_layout.setSpacing(5)
+        self.tag_list_layout.addStretch(1)
+        self.tag_list_scroll.setWidget(self.tag_list_content)
+
+        # ON: プリセット編集の登録タグ欄と同じように、横へ詰めて折り返す。
+        # チェックボックス + タグチップを1ユニットとして ChipWrapArea に渡す。
+        self.tag_compact_scroll = ChipWrapArea()
+        self.tag_compact_scroll.setObjectName("TagPresetCompactTagArea")
+        self.tag_compact_scroll.set_tag_reorder_enabled(False)
+
+        self.tag_area_stack = QWidget()
+        tag_area_stack_layout = QGridLayout(self.tag_area_stack)
+        tag_area_stack_layout.setContentsMargins(0, 0, 0, 0)
+        tag_area_stack_layout.setSpacing(0)
+        tag_area_stack_layout.addWidget(self.tag_list_scroll, 0, 0)
+        tag_area_stack_layout.addWidget(self.tag_compact_scroll, 0, 0)
+
+        apply_button = QPushButton("反映")
+        close_button = QPushButton("終了")
+        apply_button.clicked.connect(self._emit_apply_requested)
+        close_button.clicked.connect(self.close_requested.emit)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        action_row.addWidget(apply_button)
+        action_row.addSpacing(16)
+        action_row.addWidget(close_button)
+        action_row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(7)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.tab_bar)
+        layout.addLayout(self.slot_grid)
+        layout.addLayout(target_row)
+        layout.addWidget(self.tag_area_stack, 1)
+        layout.addLayout(action_row)
+
+        self._search_chips: list[tuple[str, SearchHighlightButton]] = []
+        self._preset_search = PresetTagSearchController(
+            self.preset_search_bar,
+            lambda: self._search_chips,
+            lambda: self.tag_compact_scroll if self._compact_tags else self.tag_list_scroll,
+        )
+        self._rebuild_preset_buttons()
+        self._refresh_tag_rows()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_breadcrumb()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        """タイトル部分だけをドラッグハンドルとして、親領域内でパネルを移動する。"""
+        if watched is self.breadcrumb_bar and event.type() == QEvent.Type.Resize:
+            # 実際に割り当てられた左側幅で両方の名前を省略する。
+            self._update_breadcrumb()
+
+        if watched is self.title_label:
+            if (
+                event.type() == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                global_pos = event.globalPosition().toPoint()
+                self._title_drag_offset = self.mapFromGlobal(global_pos)
+                self.raise_()
+                # press自体はQLabelへ通し、Qt標準のマウスグラブを維持する。
+                event.accept()
+                return False
+
+            if (
+                event.type() == QEvent.Type.MouseMove
+                and self._title_drag_offset is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                parent = self.parentWidget()
+                if parent is not None:
+                    global_pos = event.globalPosition().toPoint()
+                    wanted_global = global_pos - self._title_drag_offset
+                    wanted = parent.mapFromGlobal(wanted_global)
+                    next_pos = self.clamp_position_to_parent(wanted)
+                    self.move(next_pos)
+                    self.raise_()
+                    self.position_changed.emit(QPoint(next_pos))
+                event.accept()
+                return True
+
+            if event.type() in (
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.MouseButtonDblClick,
+            ):
+                self._title_drag_offset = None
+
+        return super().eventFilter(watched, event)
+
+    def clamp_position_to_parent(self, position: QPoint) -> QPoint:
+        parent = self.parentWidget()
+        if parent is None:
+            return QPoint(position)
+
+        max_x = max(0, parent.width() - self.width())
+        max_y = max(0, parent.height() - self.height())
+        return QPoint(
+            max(0, min(position.x(), max_x)),
+            max(0, min(position.y(), max_y)),
+        )
+
+    def set_tag_color_enabled(self, enabled: bool) -> None:
+        self._tag_color_enabled = bool(enabled)
+        self._refresh_tag_rows()
+
+    def set_compact_tags(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._compact_tags == enabled:
+            return
+        self._compact_tags = enabled
+        self._refresh_tag_rows()
+
+    def refresh_from_state(self) -> None:
+        self._refresh_tab_labels()
+        self._rebuild_preset_buttons()
+        self._refresh_tag_rows()
+
+    def _refresh_tab_labels(self) -> None:
+        self.tab_bar.blockSignals(True)
+        try:
+            for index, name in enumerate(self._state.tab_names):
+                self.tab_bar.set_full_tab_name(index, name)
+            self.tab_bar.setCurrentIndex(self._state.selected_tab_index)
+        finally:
+            self.tab_bar.blockSignals(False)
+        self._update_breadcrumb()
+
+    def _on_tab_changed(self, tab_index: int) -> None:
+        if not (0 <= tab_index < TAG_PRESET_TAB_COUNT):
+            return
+        changed = self._state.select_tab_index(tab_index)
+        # タブは表示ページだけを変える。現在のタグ一覧・チェック・反映対象は維持。
+        self._rebuild_preset_buttons()
+        if changed:
+            self.state_changed.emit()
+
+    def _on_tab_context_menu(self, position: QPoint) -> None:
+        tab_index = self.tab_bar.tabAt(position)
+        if 0 <= tab_index < TAG_PRESET_TAB_COUNT:
+            self.rename_tab_requested.emit(tab_index)
+
+    def _rebuild_preset_buttons(self) -> None:
+        while self.slot_grid.count():
+            item = self.slot_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._preset_buttons.clear()
+
+        begin = self._state.selected_tab_index * TAG_PRESET_SLOTS_PER_TAB
+        presets = self._state.presets[begin:begin + TAG_PRESET_SLOTS_PER_TAB]
+        for local_index, preset in enumerate(presets):
+            index = begin + local_index
+            button = ElidedPresetSlotButton(preset.name)
+            button.setObjectName("TagPresetSlotButton")
+            button.setCheckable(True)
+            button.setChecked(preset.preset_id == self._state.selected_preset_id)
+            button.setToolTip(f"{preset.name}\n左クリック: 選択 / 右クリック: 編集")
+            button.clicked.connect(
+                lambda _checked=False, i=index: self._select_preset(i)
+            )
+            button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            button.customContextMenuRequested.connect(
+                lambda _pos, i=index: self.edit_requested.emit(i)
+            )
+            self.slot_grid.addWidget(button, local_index // 2, local_index % 2)
+            self._preset_buttons.append(button)
+        self._update_breadcrumb()
+
+    def _select_preset(self, index: int) -> None:
+        if not (0 <= index < len(self._state.presets)):
+            return
+        changed = self._state.select_index(index)
+        begin = self._state.selected_tab_index * TAG_PRESET_SLOTS_PER_TAB
+        for local_index, button in enumerate(self._preset_buttons):
+            button.blockSignals(True)
+            button.setChecked(begin + local_index == index)
+            button.blockSignals(False)
+        self._update_breadcrumb()
+        self._refresh_tag_rows()
+        if changed:
+            self.state_changed.emit()
+
+    def _update_breadcrumb(self) -> None:
+        if not hasattr(self, "breadcrumb_bar"):
+            return
+        # 閲覧中のページではなく、現在実際に反映されるプリセットの所属タブ。
+        tab_index = self._state.selected_index() // TAG_PRESET_SLOTS_PER_TAB
+        tab_name = self._state.tab_names[tab_index]
+        preset_name = self._state.selected_preset().name
+        self.breadcrumb_tab_label.setToolTip(tab_name)
+        self.breadcrumb_preset_label.setToolTip(preset_name)
+
+        # 操作ボタンを同じ行に置いているため、パネル全幅ではなく
+        # パンくず自身にレイアウトが割り当てた幅を上限にする。
+        # 長いタブ名よりもプリセット名を優先して表示する。
+        tab_font = self.breadcrumb_tab_label.fontMetrics()
+        preset_font = self.breadcrumb_preset_label.fontMetrics()
+        sep_width = self.breadcrumb_separator_label.sizeHint().width()
+        # 左右margin(7+3)と3つのspacing(8*3)を除外する。
+        available = max(0, self.breadcrumb_bar.width() - 10 - 24 - sep_width)
+        tab_needed = tab_font.horizontalAdvance(tab_name) + 2
+        preset_needed = preset_font.horizontalAdvance(preset_name) + 2
+        tab_width = min(tab_needed, int(available * 0.4))
+        preset_width = min(preset_needed, max(0, available - tab_width))
+        self.breadcrumb_tab_label.setText(
+            tab_font.elidedText(tab_name, Qt.TextElideMode.ElideRight, tab_width)
+        )
+        self.breadcrumb_preset_label.setText(
+            preset_font.elidedText(preset_name, Qt.TextElideMode.ElideRight, preset_width)
+        )
+        self.breadcrumb_tab_label.setFixedWidth(tab_width)
+        self.breadcrumb_preset_label.setFixedWidth(preset_width)
+
+    def _clear_vertical_tag_rows(self) -> None:
+        while self.tag_list_layout.count() > 1:
+            item = self.tag_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _make_check_tag_widget(self, index: int, entry: TagPresetEntry) -> QWidget:
+        # チェックボックスとタグを同じカテゴリ色の外枠で囲み、1ユニットとして見せる。
+        # タグ文字列側をクリックした場合もチェック状態を切り替える。
+        row = PresetCheckTagWidget(
+            entry.text,
+            bool(entry.checked),
+            frame_qss=self._preset_check_tag_qss(entry.text),
+        )
+        row.checkbox.toggled.connect(
+            lambda checked, i=index: self._on_tag_checked(i, checked)
+        )
+        row.context_menu_requested.connect(self.tag_context_menu_requested.emit)
+        self._checkboxes.append(row.checkbox)
+        return row
+
+    def _preset_check_tag_qss(self, tag: str) -> str:
+        """プリセット適用タグ用の、チェック欄まで含めた一体型カテゴリ色QSSを返す。"""
+        # unknown / 色分けOFF は通常のTagChipと同じ配色へ合わせる。
+        background = "#17202c"
+        hover_background = "#202d3d"
+        border = "#3d4a5c"
+        hover_border = "#7fb2ff"
+        text_color = "#e8e8e8"
+
+        if self._tag_color_enabled and self._tag_color_dictionary is not None:
+            style = self._tag_color_dictionary.style_for_tag(tag)
+            # unknown は tag_chip_qss() が None を返すため、上の通常青系配色を使う。
+            if tag_chip_qss(style) is not None:
+                background = style.color
+                hover_background = style.hover_color
+                border = style.border_color
+                hover_border = style.border_color
+                text_color = style.text_color
+
+        return f"""
+            QFrame#PresetCheckTagUnit {{
+                background: {background};
+                border: 1px solid {border};
+                border-radius: 9px;
+            }}
+            QFrame#PresetCheckTagUnit:hover {{
+                background: {hover_background};
+                border-color: {hover_border};
+            }}
+            QPushButton#PresetCheckIndicator {{
+                color: #57e389;
+                background: transparent;
+                border: 1px solid #607080;
+                border-radius: 4px;
+                padding: 0px;
+                margin: 0px;
+                font-size: 15px;
+                font-weight: 900;
+                text-align: center;
+            }}
+            QPushButton#PresetCheckIndicator:hover {{
+                background: rgba(127, 178, 255, 0.10);
+                border-color: {hover_border};
+            }}
+            QPushButton#PresetCheckIndicator:checked {{
+                color: #57e389;
+                background: rgba(69, 212, 131, 0.08);
+                border-color: #57e389;
+                font-weight: 900;
+            }}
+            QPushButton#PresetCheckIndicator:checked:hover {{
+                color: #7cf0a7;
+                background: rgba(69, 212, 131, 0.14);
+                border-color: #7cf0a7;
+            }}
+            QPushButton#PresetTagToggleButton {{
+                color: {text_color};
+                background: transparent;
+                border: none;
+                padding: 5px 8px 5px 2px;
+                margin: 0px;
+                text-align: left;
+            }}
+            QPushButton#PresetTagToggleButton:hover {{
+                color: {text_color};
+                background: transparent;
+                border: none;
+            }}
+            QPushButton#PresetTagToggleButton:pressed {{
+                color: #ffffff;
+                background: transparent;
+                border: none;
+            }}
+        """
+
+    def _refresh_tag_rows(self) -> None:
+        self._search_chips.clear()
+        self._clear_vertical_tag_rows()
+        # 反対側の折り返し領域に残っているWidgetも解放する。
+        self.tag_compact_scroll.set_chips([])
+        self._checkboxes.clear()
+
+        preset = self._state.selected_preset()
+        if not preset.tags:
+            empty = QLabel(
+                "このプリセットにはタグが登録されていません。\n"
+                "プリセットボタンを右クリックして編集できます。"
+            )
+            empty.setWordWrap(True)
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet("color: #999999; padding: 20px 8px;")
+
+            if self._compact_tags:
+                self.tag_compact_scroll.set_chips([empty])
+            else:
+                self.tag_list_layout.insertWidget(0, empty)
+
+            self._sync_tag_area_visibility()
+            self._preset_search.refresh()
+            return
+
+        widgets = [
+            self._make_check_tag_widget(index, entry)
+            for index, entry in enumerate(preset.tags)
+        ]
+
+        self._search_chips = [
+            (entry.text, widget.tag_button)
+            for entry, widget in zip(preset.tags, widgets)
+        ]
+        if self._compact_tags:
+            self.tag_compact_scroll.set_chips(widgets)
+            self.tag_compact_scroll.refresh_after_show()
+        else:
+            for index, row in enumerate(widgets):
+                self.tag_list_layout.insertWidget(
+                    index,
+                    row,
+                    0,
+                    Qt.AlignmentFlag.AlignLeft,
+                )
+
+        self._sync_tag_area_visibility()
+        self._preset_search.refresh()
+
+    def _sync_tag_area_visibility(self) -> None:
+        self.tag_compact_scroll.setVisible(self._compact_tags)
+        self.tag_list_scroll.setVisible(not self._compact_tags)
+        if self._compact_tags:
+            QTimer.singleShot(0, self.tag_compact_scroll.refresh_after_show)
+
+    def _on_tag_checked(self, index: int, checked: bool) -> None:
+        preset = self._state.selected_preset()
+        if not (0 <= index < len(preset.tags)):
+            return
+        if preset.tags[index].checked == bool(checked):
+            return
+        preset.tags[index].checked = bool(checked)
+        self.state_changed.emit()
+
+    def _set_all_checked(self, checked: bool) -> None:
+        preset = self._state.selected_preset()
+        changed = False
+        for entry in preset.tags:
+            if entry.checked != bool(checked):
+                entry.checked = bool(checked)
+                changed = True
+        if not changed:
+            return
+        self._refresh_tag_rows()
+        self.state_changed.emit()
+
+    def _emit_apply_requested(self) -> None:
+        preset = self._state.selected_preset()
+        tags = [entry.text for entry in preset.tags if entry.checked]
+        self.apply_requested.emit(tags, preset.name)
+
+    def _tag_chip_qss(self, tag: str) -> str:
+        # 左側タグ欄と完全に同じ判定経路を優先する。
+        if self._tag_qss_provider is not None:
+            return self._tag_qss_provider(tag) or TAG_CHIP_QSS
+        if self._tag_color_enabled and self._tag_color_dictionary is not None:
+            style = self._tag_color_dictionary.style_for_tag(tag)
+            return tag_chip_qss(style) or TAG_CHIP_QSS
+        return TAG_CHIP_QSS
+
 
 class EditTagDialog(QDialog):
     """
@@ -2537,52 +3862,155 @@ class FlowChipWrapArea(QScrollArea):
                 self._schedule_rebuild(force=True)
 
 
-class ActiveFilterChip(QPushButton):
-    """右側フィルタ管理エリアに表示する、クリックで解除可能な条件チップ。"""
+class ActiveFilterChip(QFrame):
+    """フィルタ条件管理欄専用のコンパクトチップ。
 
+    緑○/赤○は角丸の条件チップ内、解除の×は外側に独立配置する。
+    タグ名は表示専用（右クリックの共通タグメニューには対応）。
+    """
+
+    include_requested = Signal(str)
+    exclude_requested = Signal(str)
     remove_requested = Signal(str)
     context_menu_requested = Signal(str, QPoint)
 
     def __init__(self, tag: str, mode: str) -> None:
         super().__init__()
+        if mode not in ("include", "exclude"):
+            raise ValueError(f"Invalid active filter mode: {mode!r}")
         self.tag = tag
         self.mode = mode
-
-        display_tag = shorten_text(tag, 24)
-        self.setText(f"{display_tag}  ×")
-        self.setToolTip(f"{tag}\nクリックでこのフィルタ条件を解除")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
-        if mode == "include":
-            border = "#31945a"
-            color = "#9be9b5"
-            hover = "rgba(34, 197, 94, 0.20)"
-        else:
-            border = "#a64a4a"
-            color = "#ffabab"
-            hover = "rgba(239, 68, 68, 0.20)"
+        self.chip_frame = QFrame(self)
+        self.chip_frame.setObjectName("ActiveFilterChipBody")
+        self.chip_frame.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        outline_color = "#31945a" if mode == "include" else "#a64a4a"
+        self.chip_frame.setStyleSheet(
+            f"QFrame#ActiveFilterChipBody {{ background: #17202b; "
+            f"border: 2px solid {outline_color}; border-radius: 8px; }}"
+        )
 
-        self.setStyleSheet(
+        self.include_button = QPushButton("●" if mode == "include" else "○")
+        self.include_button.setObjectName("ActiveFilterIncludeButton")
+        self.include_button.setFixedSize(19, 19)
+        self.include_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.include_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.include_button.setToolTip("含む条件に切替" if mode != "include" else "含む条件（選択中）")
+        self.include_button.setStyleSheet(
             f"""
-            QPushButton {{
-                color: {color};
-                background: #17202b;
-                border: 1px solid {border};
-                border-radius: 11px;
-                padding: 3px 8px;
+            QPushButton#ActiveFilterIncludeButton {{
+                color: {'#8dffae' if mode == 'include' else GREEN};
+                background: {'rgba(34, 197, 94, 0.22)' if mode == 'include' else 'transparent'};
+                border: {'1px solid #3fbf75' if mode == 'include' else 'none'};
+                border-radius: 4px;
+                padding: 0;
+                font-size: 14px;
                 font-weight: bold;
             }}
-            QPushButton:hover {{
-                background: {hover};
+            QPushButton#ActiveFilterIncludeButton:hover {{
+                color: #b2ffc8;
+                background: rgba(34, 197, 94, 0.30);
+                border: 1px solid #72ff9c;
             }}
             """
         )
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(
-            lambda pos: self.context_menu_requested.emit(self.tag, self.mapToGlobal(pos))
+        self.include_button.clicked.connect(lambda: self.include_requested.emit(self.tag))
+
+        self.exclude_button = QPushButton("●" if mode == "exclude" else "○")
+        self.exclude_button.setObjectName("ActiveFilterExcludeButton")
+        self.exclude_button.setFixedSize(19, 19)
+        self.exclude_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.exclude_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.exclude_button.setToolTip("除外条件に切替" if mode != "exclude" else "除外条件（選択中）")
+        self.exclude_button.setStyleSheet(
+            f"""
+            QPushButton#ActiveFilterExcludeButton {{
+                color: {'#ff9a9a' if mode == 'exclude' else RED};
+                background: {'rgba(239, 68, 68, 0.22)' if mode == 'exclude' else 'transparent'};
+                border: {'1px solid #d35b5b' if mode == 'exclude' else 'none'};
+                border-radius: 4px;
+                padding: 0;
+                font-size: 14px;
+                font-weight: bold;
+            }}
+            QPushButton#ActiveFilterExcludeButton:hover {{
+                color: #ffb8b8;
+                background: rgba(239, 68, 68, 0.30);
+                border: 1px solid #ff8a8a;
+            }}
+            """
         )
-        self.clicked.connect(lambda: self.remove_requested.emit(self.tag))
+        self.exclude_button.clicked.connect(lambda: self.exclude_requested.emit(self.tag))
+
+        self.tag_label = QLabel(shorten_text(tag, 24))
+        self.tag_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.tag_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tag_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.tag_label.setToolTip(tag)
+        self.tag_label.setStyleSheet(
+            "QLabel { color: #e6e9f0; background: transparent; border: none; "
+            "padding: 0px 2px; font-size: 11px; font-weight: bold; }"
+        )
+
+        inner = QHBoxLayout(self.chip_frame)
+        inner.setContentsMargins(2, 1, 2, 1)
+        inner.setSpacing(1)
+        inner.addWidget(self.include_button)
+        inner.addWidget(self.tag_label)
+        inner.addWidget(self.exclude_button)
+
+        # ×は条件チップの角丸枠「外側」。クリック先は解除処理だけに限定する。
+        self.remove_button = QPushButton("×")
+        self.remove_button.setObjectName("ActiveFilterRemoveButton")
+        self.remove_button.setFixedSize(18, 18)
+        self.remove_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.remove_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.remove_button.setToolTip("このフィルタ条件を解除")
+        self.remove_button.setStyleSheet(
+            """
+            QPushButton#ActiveFilterRemoveButton {
+                color: #d8e8fa;
+                background: #17202b;
+                border: 1px solid #45617e;
+                border-radius: 9px;
+                padding: 0;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton#ActiveFilterRemoveButton:hover {
+                color: white;
+                background: #345777;
+                border-color: #78b8ff;
+            }
+            """
+        )
+        self.remove_button.clicked.connect(lambda: self.remove_requested.emit(self.tag))
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+        outer.addWidget(self.chip_frame)
+        outer.addWidget(self.remove_button)
+
+        for widget in (self, self.chip_frame, self.tag_label,
+                       self.include_button, self.exclude_button, self.remove_button):
+            widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda pos, source=widget: self.context_menu_requested.emit(
+                    self.tag, source.mapToGlobal(pos)
+                )
+            )
+
+    def fit_display_to_total_width(self, available_width: int) -> None:
+        """ラベルだけを末尾省略し、○や枠外×は狭い欄でも維持する。"""
+        self.tag_label.setText(self.tag)
+        extra_width = self.sizeHint().width() - self.tag_label.sizeHint().width()
+        text_width = max(16, int(available_width) - extra_width - 2)
+        display = self.tag_label.fontMetrics().elidedText(
+            self.tag, Qt.TextElideMode.ElideRight, text_width
+        )
+        self.tag_label.setText(display)
 
 
 class CompactChipWrapArea(QWidget):
@@ -2678,6 +4106,8 @@ class CompactChipWrapArea(QWidget):
             for chip in self._chips:
                 chip.setParent(self)
                 chip.ensurePolished()
+                if isinstance(chip, ActiveFilterChip):
+                    chip.fit_display_to_total_width(usable_width)
                 chip_width = chip.sizeHint().width()
                 chip_height = chip.sizeHint().height()
 
@@ -2899,6 +4329,13 @@ class TagPanel(QFrame):
         # Danbooru補完辞書は固定CSVとして起動時に一度だけ読む。
         # 未配置でも通常のタグ編集は止めず、補完だけ無効にする。
         self._danbooru_tag_dictionary = DanbooruTagDictionary.load()
+        # タグプリセット本体は一般設定から分離し、config/tag_presets.json で永続化する。
+        self._tag_preset_state = load_tag_preset_state()
+        # 表示方法だけは環境設定(config/settings.json)側。AppWindowから既存設定が
+        # 適用されるまでの初期値は従来表示(1タグ1行)にする。
+        self._tag_preset_compact_enabled = False
+        # パネル位置は起動中だけ保持する。None は右側タグ欄上の既定位置を表す。
+        self._tag_preset_panel_position: QPoint | None = None
         # Tagger実行中はTaggerタブに留め、保存や通常タグ編集と競合しないようにする。
         self._tagger_execution_locked = False
         self._tab_enabled_before_tagger_lock: dict[int, bool] = {}
@@ -3061,6 +4498,7 @@ class TagPanel(QFrame):
             dedupe_callback=self.dedupe_current_targets,
             edit_callback=self.edit_current_selected_tags,
             move_to_front_callback=self.move_current_selected_tag_to_front,
+            preset_callback=self.toggle_tag_preset_panel,
             sort_callback=self._toggle_current_sort_search_popup,
         )
         self.all_toolbar = self._make_toolbar(
@@ -3351,7 +4789,8 @@ class TagPanel(QFrame):
         current_panel.addWidget(current_tag_area_stack, 1)
         current_panel.addLayout(current_tag_count_layout)
 
-        all_panel = QVBoxLayout()
+        self.all_panel_widget = QWidget()
+        all_panel = QVBoxLayout(self.all_panel_widget)
         # 左側は CurrentTagHoverArea 内のレイアウトで余白0にしているため、
         # 右側も同じ余白・間隔に揃える。デフォルト余白が残ると検索欄以下が
         # 右側だけ少し下へずれて見える。
@@ -3364,9 +4803,32 @@ class TagPanel(QFrame):
         all_panel.addWidget(all_tag_area_stack, 1)
         all_panel.addLayout(all_tag_count_layout)
 
+        self.preset_panel = TagPresetPanel(
+            self._tag_preset_state,
+            self,
+            tag_color_dictionary=self._tag_color_dictionary,
+            tag_color_enabled=self._tag_color_enabled,
+            tag_qss_provider=self._tag_chip_category_qss,
+            compact_tags=self._tag_preset_compact_enabled,
+        )
+        self.preset_panel.apply_requested.connect(self._apply_tag_preset_tags)
+        self.preset_panel.close_requested.connect(self.close_tag_preset_panel)
+        self.preset_panel.edit_requested.connect(self._edit_tag_preset)
+        self.preset_panel.rename_tab_requested.connect(self._rename_tag_preset_tab)
+        self.preset_panel.state_changed.connect(self._save_tag_preset_state)
+        self.preset_panel.position_changed.connect(self._remember_tag_preset_panel_position)
+        self.preset_panel.tag_context_menu_requested.connect(self._show_tag_context_menu)
+        self.preset_panel.hide()
+
+        self.right_panel_stack = QWidget()
+        right_panel_stack_layout = QGridLayout(self.right_panel_stack)
+        right_panel_stack_layout.setContentsMargins(0, 0, 0, 0)
+        right_panel_stack_layout.setSpacing(0)
+        right_panel_stack_layout.addWidget(self.all_panel_widget, 0, 0)
+
         lists_layout = QHBoxLayout()
         lists_layout.addWidget(self.current_hover_area, 1)
-        lists_layout.addLayout(all_panel, 1)
+        lists_layout.addWidget(self.right_panel_stack, 1)
 
         self.format_tabs = QTabWidget()
         self.format_tabs.setObjectName("FormatTabs")
@@ -3376,6 +4838,10 @@ class TagPanel(QFrame):
         self.format_tabs.setStyleSheet(TAG_SUB_TABS_QSS)
 
         self.tag_format_page = QWidget()
+        # プリセットは通常レイアウトへ入れず、タグ形式ページ直下のフローティング子Widgetにする。
+        # これによりタイトルドラッグで左右パネル上を自由に移動できる。
+        self.preset_panel.setParent(self.tag_format_page)
+        self.preset_panel.hide()
 
         tag_format_layout = QVBoxLayout(self.tag_format_page)
         # 下側の余白を詰め、左右タグ一覧の表示領域を少し縦に広げる。
@@ -3454,6 +4920,9 @@ class TagPanel(QFrame):
             self._place_current_sort_search_popup()
         if hasattr(self, "all_sort_search_popup") and self.all_sort_search_popup.isVisible():
             self._place_all_sort_search_popup()
+        if hasattr(self, "preset_panel") and self.preset_panel.isVisible():
+            # レイアウト確定後の right_panel_stack サイズで追従させる。
+            QTimer.singleShot(0, self._place_tag_preset_panel)
 
     def _place_floating_save_button(self) -> None:
         """
@@ -3504,6 +4973,7 @@ class TagPanel(QFrame):
         dedupe_callback,
         edit_callback,
         move_to_front_callback=None,
+        preset_callback=None,
         sort_callback=None,
     ) -> QWidget:
         """
@@ -3511,11 +4981,11 @@ class TagPanel(QFrame):
 
         左側:
             [並べ替え] [編集] [追加] [削除]
-            [重複削除] [先頭へ] [      ] [      ]
+            [重複削除] [先頭へ] [プリセット] [      ]
 
         右側:
             [並べ替え] [編集] [追加] [削除]
-            [重複削除] [      ] [      ] [      ]
+            [重複削除] [      ] [          ] [      ]
 
         検索ボタンは、右側タグ一覧に常設検索バーを追加したため廃止する。
         """
@@ -3575,12 +5045,273 @@ class TagPanel(QFrame):
             spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             grid.addWidget(spacer, 1, 1)
 
-        for column in (2, 3):
+        if preset_callback is not None:
+            preset_button = configure_button(QPushButton("プリセット"))
+            self._preset_toolbar_button = preset_button
+            preset_button.setCheckable(True)
+            preset_button.setToolTip("タグプリセットを開きます")
+            # パネル表示中だけ、押下色＋控えめな青い発光でON状態を示す。
+            # OFF時はアプリ共通の通常ボタンQSSを引き続き使用する。
+            preset_button.setStyleSheet("""
+                QPushButton:checked {
+                    background: #315872;
+                    color: #f0f9ff;
+                    border: 1px solid #79c6ff;
+                    border-radius: 6px;
+                    font-weight: bold;
+                }
+                QPushButton:checked:hover {
+                    background: #3a6685;
+                    border-color: #a0dcff;
+                }
+            """)
+            glow = QGraphicsDropShadowEffect(preset_button)
+            glow.setBlurRadius(21.0)
+            glow.setOffset(0, 0)
+            glow.setColor(QColor(80, 175, 255, 185))
+            preset_button.setGraphicsEffect(glow)
+            glow.setEnabled(False)
+            self._preset_toolbar_glow = glow
+            preset_button.clicked.connect(preset_callback)
+            grid.addWidget(preset_button, 1, 2)
+        else:
             spacer = QWidget()
             spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            grid.addWidget(spacer, 1, column)
+            grid.addWidget(spacer, 1, 2)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        grid.addWidget(spacer, 1, 3)
 
         return frame
+
+    def _sync_preset_toolbar_button(self) -> None:
+        """プリセットウィンドウの開閉に合わせ、起動ボタンの発光を切り替える。"""
+        button = getattr(self, "_preset_toolbar_button", None)
+        if button is None:
+            return
+        active = hasattr(self, "preset_panel") and self.preset_panel.isVisible()
+        # clickedで一時的に変化したチェックを、実際のパネル表示状態へ同期する。
+        button.setChecked(active)
+        button.setToolTip("タグプリセットを閉じます" if active else "タグプリセットを開きます")
+        glow = getattr(self, "_preset_toolbar_glow", None)
+        if glow is not None:
+            glow.setEnabled(active)
+
+    def toggle_tag_preset_panel(self) -> None:
+        """プリセットボタンをトグルとして扱い、表示中なら閉じ、非表示なら開く。"""
+        if not hasattr(self, "preset_panel"):
+            return
+        if self.preset_panel.isVisible():
+            self.close_tag_preset_panel()
+            return
+        self.open_tag_preset_panel()
+
+    def open_tag_preset_panel(self) -> None:
+        """既定は右側タグ欄上。起動中に移動済みならその位置で再表示する。"""
+        if not hasattr(self, "preset_panel"):
+            return
+        self.preset_panel.refresh_from_state()
+        self._place_tag_preset_panel()
+        self.preset_panel.show()
+        self.preset_panel.raise_()
+        self._sync_preset_toolbar_button()
+        # show後にレイアウトが最終確定する環境向けにもう一度だけ補正する。
+        QTimer.singleShot(0, self._place_tag_preset_panel)
+
+    def close_tag_preset_panel(self) -> None:
+        """タグプリセットパネルを閉じる。位置・チェック状態は維持する。"""
+        if hasattr(self, "preset_panel"):
+            self.preset_panel.hide()
+        self._sync_preset_toolbar_button()
+
+    def _remember_tag_preset_panel_position(self, position: object) -> None:
+        """ドラッグ後の位置はこの起動中だけ保持し、アプリ再起動では既定位置へ戻す。"""
+        if isinstance(position, QPoint):
+            self._tag_preset_panel_position = QPoint(position)
+
+    def _place_tag_preset_panel(self) -> None:
+        """右側パネル相当のサイズを保ちつつ、保存済みの起動中位置へ配置する。"""
+        if not (
+            hasattr(self, "preset_panel")
+            and hasattr(self, "right_panel_stack")
+            and hasattr(self, "tag_format_page")
+        ):
+            return
+
+        page = self.tag_format_page
+        right_panel = self.right_panel_stack
+        panel = self.preset_panel
+
+        default_top_left = right_panel.mapTo(page, QPoint(0, 0))
+        target_width = max(260, right_panel.width())
+        base_height = max(260, right_panel.height())
+
+        # 下端を保ちつつ上側へ約1行分拡張し、登録タグ欄の縦幅を確保する。
+        # 親領域より大きくならないように制限する。
+        target_width = min(target_width, max(1, page.width()))
+        base_height = min(base_height, max(1, page.height()))
+        target_height = min(base_height + 32, max(1, page.height()))
+        upward_extension = target_height - base_height
+        panel.resize(target_width, target_height)
+
+        # ユーザーがドラッグした位置は維持。既定位置では増加分だけ上へ伸ばす。
+        wanted = (
+            QPoint(self._tag_preset_panel_position)
+            if self._tag_preset_panel_position is not None
+            else QPoint(default_top_left.x(), default_top_left.y() - upward_extension)
+        )
+        next_pos = panel.clamp_position_to_parent(wanted)
+        panel.move(next_pos)
+        if self._tag_preset_panel_position is not None:
+            self._tag_preset_panel_position = QPoint(next_pos)
+        panel.raise_()
+
+    def _save_tag_preset_state(self, *, show_error: bool = False) -> bool:
+        """現在のタグプリセット状態を専用JSONへ保存する。"""
+        try:
+            save_tag_preset_state(self._tag_preset_state)
+        except OSError as error:
+            log.warning("タグプリセット設定の保存に失敗しました: %s", error)
+            if show_error:
+                QMessageBox.warning(
+                    self,
+                    "タグプリセット",
+                    f"タグプリセット設定を保存できませんでした。\n\n{error}",
+                )
+            return False
+        return True
+
+    def _rename_tag_preset_tab(self, index: int) -> None:
+        """タブ右クリックから名前だけ変更し、プリセット本体と同じJSONへ保存。"""
+        if not (0 <= index < TAG_PRESET_TAB_COUNT):
+            return
+        dialog = TagPresetTabRenameDialog(
+            self._tag_preset_state.tab_names[index], parent=self.preset_panel
+        )
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if not self._tag_preset_state.rename_tab(index, dialog.tab_name()):
+                return
+            self._save_tag_preset_state(show_error=True)
+            self.preset_panel.refresh_from_state()
+        finally:
+            dialog.deleteLater()
+
+    def _edit_tag_preset(self, index: int) -> None:
+        """指定プリセットをモーダル編集画面で編集する。"""
+        if not (0 <= index < len(self._tag_preset_state.presets)):
+            return
+
+        preset = self._tag_preset_state.presets[index]
+        default_name = f"プリセット{index + 1}"
+        dialog = TagPresetEditDialog(
+            preset_name=preset.name,
+            preset_entries=preset.tags,
+            default_name=default_name,
+            parent=self,
+            tag_dictionary=self._danbooru_tag_dictionary,
+            tag_color_dictionary=self._tag_color_dictionary,
+            tag_color_enabled=self._tag_color_enabled,
+            tag_qss_provider=self._tag_chip_category_qss,
+            tag_completion_enabled=self._tag_completion_enabled,
+            tag_completion_limit=self._tag_completion_limit,
+        )
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+
+            if dialog.reset_requested():
+                preset.name = default_name
+                preset.tags = []
+            else:
+                preset.name = dialog.preset_name()
+                preset.tags = dialog.entries()
+
+            if not self._save_tag_preset_state(show_error=True):
+                return
+            self.preset_panel.refresh_from_state()
+        finally:
+            dialog.deleteLater()
+
+    def _apply_tag_preset_tags(self, tags: object, preset_name: str) -> None:
+        """チェック済みプリセットタグを現在の左側操作対象へ末尾追加する。"""
+        if not isinstance(tags, list):
+            return
+        selected_tags = self._unique_tags(
+            [str(tag).strip() for tag in tags if str(tag).strip()]
+        )
+        if not selected_tags:
+            QMessageBox.information(
+                self,
+                "タグプリセット",
+                "反映するタグにチェックを付けてください。",
+            )
+            return
+
+        indexes = self._target_indexes()
+        if not indexes:
+            QMessageBox.information(
+                self,
+                "タグプリセット",
+                "タグを反映する画像がありません。",
+            )
+            return
+
+        before_history = self._snapshot_tags_for_indexes(indexes)
+        added_counter: Counter[str] = Counter()
+
+        for index in indexes:
+            if not (0 <= index < len(self.items)):
+                continue
+            item = self.items[index]
+            before = list(item.tags)
+            for tag in selected_tags:
+                if tag in item.tags:
+                    continue
+                item.tags.append(tag)
+                added_counter[tag] += 1
+            if item.tags != before:
+                item.refresh_dirty()
+
+        changed_before, changed_after, target_image_paths, target_tag_paths = (
+            self._tag_history_changes_from_snapshot(before_history)
+        )
+        if not changed_before:
+            return
+
+        effective_counts = {
+            tag: count
+            for tag, count in added_counter.items()
+            if count > 0
+        }
+        summary = f"対象{len(changed_before)}枚 / {len(effective_counts)}タグ"
+        detail_lines = [
+            "タグプリセットを反映しました。",
+            "",
+            f"プリセット: {preset_name}",
+            f"変更画像: {len(changed_before)}枚",
+            "",
+            "タグ別内訳:",
+        ]
+        for tag in selected_tags:
+            count = effective_counts.get(tag, 0)
+            if count > 0:
+                detail_lines.append(f"- {tag}: {count}枚")
+
+        self._push_tag_history_entry(
+            operation_type="プリセット反映",
+            summary=summary,
+            detail="\n".join(detail_lines),
+            target_image_paths=target_image_paths,
+            target_tag_paths=target_tag_paths,
+            before_tags_by_path=changed_before,
+            after_tags_by_path=changed_after,
+            tag_counts_by_tag=effective_counts,
+        )
+        self._refresh_after_change()
+
 
     def _normalize_tag_search_text(self, text: str) -> str:
         """検索比較用に、大文字小文字・空白・underscoreの揺れを吸収する。"""
@@ -4193,6 +5924,21 @@ class TagPanel(QFrame):
         self._tag_completion_enabled = bool(enabled)
         self._tag_completion_limit = normalize_tag_completion_limit(limit)
 
+        # AppWindowの既存 _apply_app_settings() はこのメソッドを起動時と環境設定OK後に
+        # 必ず呼ぶ。プリセット表示設定も同じ settings.json にあるため、ここで同期して
+        # 既存AppWindowを変更せず即時反映できるようにする。
+        app_settings = load_app_settings()
+        self.set_tag_preset_compact_enabled(app_settings.tag_preset_compact_enabled)
+
+    def set_tag_preset_compact_enabled(self, enabled: bool) -> None:
+        """プリセットタグを1行表示 / 折り返し詰め表示へ切り替える。"""
+        enabled = bool(enabled)
+        if self._tag_preset_compact_enabled == enabled:
+            return
+        self._tag_preset_compact_enabled = enabled
+        if hasattr(self, "preset_panel"):
+            self.preset_panel.set_compact_tags(enabled)
+
     def set_tag_color_enabled(self, enabled: bool) -> None:
         """タグカテゴリ色分けのON/OFFを切り替える。"""
         enabled = bool(enabled)
@@ -4201,6 +5947,8 @@ class TagPanel(QFrame):
 
         self._tag_color_enabled = enabled
         self._apply_tag_color_styles_to_existing_chips()
+        if hasattr(self, "preset_panel"):
+            self.preset_panel.set_tag_color_enabled(enabled)
 
     def reload_tag_color_dictionary(self) -> None:
         """タグ色分け辞書を再読み込みし、既存チップへ反映する。"""
@@ -4208,6 +5956,9 @@ class TagPanel(QFrame):
         self._tag_chip_qss_cache.clear()
         self._all_tag_chip_qss_cache.clear()
         self._apply_tag_color_styles_to_existing_chips()
+        if hasattr(self, "preset_panel"):
+            self.preset_panel._tag_color_dictionary = self._tag_color_dictionary
+            self.preset_panel.set_tag_color_enabled(self._tag_color_enabled)
 
     def _tag_chip_category_qss(self, tag: str) -> str | None:
         if not self._tag_color_enabled:
@@ -4583,6 +6334,22 @@ class TagPanel(QFrame):
             and self._single_target_override_active
         )
 
+        # サムネイルの青いプレビュー枠／黄色チェック枠と色を揃える。
+        # 「チェック中N件保持中」でも実操作対象が1枚なら青を優先する。
+        target_color = (
+            "#e0b84a"
+            if checked_count > 0 and not self._single_target_override_active
+            else "#3f8cff"
+        )
+        if self.target_label.property("targetTextColor") != target_color:
+            self.target_label.setProperty("targetTextColor", target_color)
+            self.target_label.setStyleSheet(
+                f"QLabel {{ color: {target_color}; padding: 3px 6px; "
+                "font-weight: 700; }}"
+            )
+
+        # プリセットパネルには操作対象を重複表示しない。
+        # このメソッドは左側ラベルの更新だけを担当し、反映対象の計算は従来どおり。
         if override_deactivated:
             self.single_target_override_changed.emit(False)
 
@@ -5628,6 +7395,47 @@ class TagPanel(QFrame):
                 (time.perf_counter() - perf_started) * 1000,
             )
 
+    def _set_active_filter_mode(self, tag: str, mode: str) -> None:
+        """管理欄の緑/赤から、解除の中間状態なしに含む↔除外を切り替える。"""
+        if mode not in ("include", "exclude"):
+            return
+        if tag not in self._include_filter_tags and tag not in self._exclude_filter_tags:
+            return
+        # 選択中の同色○をもう一度押しても条件は解除しない。解除は外側×だけ。
+        if mode == "include" and tag in self._include_filter_tags:
+            return
+        if mode == "exclude" and tag in self._exclude_filter_tags:
+            return
+
+        generation = self._begin_deferred_filter_ui_update()
+        try:
+            self._remember_filter_condition_anchor(tag)
+            self._include_filter_tags.discard(tag)
+            self._exclude_filter_tags.discard(tag)
+            if tag in self._include_filter_order:
+                self._include_filter_order.remove(tag)
+            if tag in self._exclude_filter_order:
+                self._exclude_filter_order.remove(tag)
+            if tag in self._filter_condition_order:
+                self._filter_condition_order.remove(tag)
+
+            if mode == "include":
+                self._include_filter_tags.add(tag)
+                self._include_filter_order.append(tag)
+            else:
+                self._exclude_filter_tags.add(tag)
+                self._exclude_filter_order.append(tag)
+            self._filter_condition_order.append(tag)
+
+            row = self._all_tag_rows.get(tag)
+            if row is not None:
+                row.set_filter_mode(mode)
+
+            self._refresh_active_filter_panel()
+            self._emit_tag_filter_changed()
+        finally:
+            self._finish_deferred_filter_ui_update_later(generation)
+
     def _remove_include_filter(self, tag: str) -> None:
         if tag not in self._include_filter_tags:
             return
@@ -5690,6 +7498,8 @@ class TagPanel(QFrame):
         include_chips: list[QWidget] = []
         for tag in self._ordered_filter_tags("include"):
             chip = ActiveFilterChip(tag, "include")
+            chip.include_requested.connect(lambda selected_tag: self._set_active_filter_mode(selected_tag, "include"))
+            chip.exclude_requested.connect(lambda selected_tag: self._set_active_filter_mode(selected_tag, "exclude"))
             chip.remove_requested.connect(self._remove_include_filter)
             self._connect_tag_context_menu(chip)
             include_chips.append(chip)
@@ -5697,6 +7507,8 @@ class TagPanel(QFrame):
         exclude_chips: list[QWidget] = []
         for tag in self._ordered_filter_tags("exclude"):
             chip = ActiveFilterChip(tag, "exclude")
+            chip.include_requested.connect(lambda selected_tag: self._set_active_filter_mode(selected_tag, "include"))
+            chip.exclude_requested.connect(lambda selected_tag: self._set_active_filter_mode(selected_tag, "exclude"))
             chip.remove_requested.connect(self._remove_exclude_filter)
             self._connect_tag_context_menu(chip)
             exclude_chips.append(chip)
