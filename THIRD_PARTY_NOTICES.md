@@ -63,3 +63,12 @@ or to the underlying training data.
 - License listed by the model card for the weights: Apache License 2.0
 - Access: The end user must review and accept any access conditions required by
   the source repository before downloading the model files.
+
+### PixAI Tagger v1.0
+
+- Model repository: `pixai-labs/pixai-tagger-v1.0`
+- [Official source at the pinned revision](https://huggingface.co/pixai-labs/pixai-tagger-v1.0/tree/9fe10addf9326e292da8a85a98ea74cd91b41771)
+- License listed by the model card: Apache License 2.0
+- The application downloads the official Safetensors weights, configuration,
+  and custom Transformers pipeline from the same revision. Tag labels from
+  the release are also used in the bundled tag color dictionary.

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from tagger.profiles import normalize_profiles
+from tagger.settings_migration import migrate_pixai_v1_settings, save_migrated_settings
 from pathlib import Path
 import json
 
@@ -131,6 +133,14 @@ def normalize_tagger_apply_mode(value: object) -> str:
     return mode if mode in _TAGGER_APPLY_MODE_VALUES else DEFAULT_TAGGER_APPLY_MODE
 
 
+def normalize_exclusion_panel_width(value: object) -> int:
+    return max(240, min(2000, value)) if type(value) is int else 350
+
+
+def normalize_exclusion_sort_mode(value: object) -> str:
+    return value if value in ("registered", "name", "category", "manual") else "registered"
+
+
 @dataclass(slots=True)
 class AppSettings:
     thumbnail_wheel_scroll_px: int = DEFAULT_THUMBNAIL_WHEEL_SCROLL_PX
@@ -142,6 +152,7 @@ class AppSettings:
     enlarged_preview_mode: str = DEFAULT_ENLARGED_PREVIEW_MODE
     tag_completion_enabled: bool = DEFAULT_TAG_COMPLETION_ENABLED
     tag_completion_limit: int = DEFAULT_TAG_COMPLETION_LIMIT
+    tagger_model_profiles: dict = field(default_factory=dict)
     tagger_model_repo: str = DEFAULT_TAGGER_MODEL_REPO
     tagger_device: str = DEFAULT_TAGGER_DEVICE
     tagger_include_general: bool = DEFAULT_TAGGER_INCLUDE_GENERAL
@@ -151,9 +162,13 @@ class AppSettings:
     tagger_include_copyright: bool = DEFAULT_TAGGER_INCLUDE_COPYRIGHT
     tagger_copyright_expanded: bool = DEFAULT_TAGGER_COPYRIGHT_EXPANDED
     tagger_apply_mode: str = DEFAULT_TAGGER_APPLY_MODE
+    tagger_exclusion_panel_open: bool = True
+    tagger_exclusion_panel_width: int = 350
+    tagger_exclusion_sort_mode: str = "registered"
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "AppSettings":
+        data = migrate_pixai_v1_settings(data)
         return cls(
             thumbnail_wheel_scroll_px=normalize_thumbnail_wheel_scroll_px(
                 data.get("thumbnail_wheel_scroll_px")
@@ -187,6 +202,7 @@ class AppSettings:
             tag_completion_limit=normalize_tag_completion_limit(
                 data.get("tag_completion_limit")
             ),
+            tagger_model_profiles=normalize_profiles(data.get("tagger_model_profiles"), data),
             tagger_model_repo=normalize_tagger_model_repo(
                 data.get("tagger_model_repo")
             ),
@@ -218,6 +234,9 @@ class AppSettings:
             tagger_apply_mode=normalize_tagger_apply_mode(
                 data.get("tagger_apply_mode")
             ),
+            tagger_exclusion_panel_open=normalize_bool(data.get("tagger_exclusion_panel_open"), default=True),
+            tagger_exclusion_panel_width=normalize_exclusion_panel_width(data.get("tagger_exclusion_panel_width")),
+            tagger_exclusion_sort_mode=normalize_exclusion_sort_mode(data.get("tagger_exclusion_sort_mode")),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -239,6 +258,7 @@ class AppSettings:
             "tag_completion_limit": normalize_tag_completion_limit(
                 self.tag_completion_limit
             ),
+            "tagger_model_profiles": normalize_profiles(self.tagger_model_profiles, {"tagger_device":self.tagger_device, "tagger_include_general":self.tagger_include_general, "tagger_general_threshold":self.tagger_general_threshold, "tagger_include_character":self.tagger_include_character, "tagger_character_threshold":self.tagger_character_threshold, "tagger_include_copyright":self.tagger_include_copyright}),
             "tagger_model_repo": normalize_tagger_model_repo(self.tagger_model_repo),
             "tagger_device": normalize_tagger_device(self.tagger_device),
             "tagger_include_general": bool(self.tagger_include_general),
@@ -254,6 +274,9 @@ class AppSettings:
             "tagger_include_copyright": bool(self.tagger_include_copyright),
             "tagger_copyright_expanded": bool(self.tagger_copyright_expanded),
             "tagger_apply_mode": normalize_tagger_apply_mode(self.tagger_apply_mode),
+            "tagger_exclusion_panel_open": bool(self.tagger_exclusion_panel_open),
+            "tagger_exclusion_panel_width": normalize_exclusion_panel_width(self.tagger_exclusion_panel_width),
+            "tagger_exclusion_sort_mode": normalize_exclusion_sort_mode(self.tagger_exclusion_sort_mode),
         }
 
 
@@ -280,8 +303,7 @@ def save_app_settings(settings: AppSettings, path: Path | None = None) -> Path:
     settings_path.parent.mkdir(parents=True, exist_ok=True)
 
     normalized = AppSettings.from_dict(settings.to_dict())
-    settings_path.write_text(
-        json.dumps(normalized.to_dict(), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    text = json.dumps(normalized.to_dict(), ensure_ascii=False, indent=2) + "\n"
+    if not save_migrated_settings(settings_path, text):
+        settings_path.write_text(text, encoding="utf-8")
     return settings_path

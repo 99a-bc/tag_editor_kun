@@ -46,6 +46,7 @@ from settings import (
 )
 from tag_io import load_tags, save_tags, tag_mtime_ns
 from tag_panel import TagPanel
+from tagger.exclusions import evaluate_exclusion, load_exclusions
 from tagger.process_client import TaggerProcessClient
 from tagger.result import TagCandidate, TaggerResult
 from tagger.session import TaggerSession
@@ -176,7 +177,7 @@ def _sort_image_paths_like_explorer(paths: list[Path], folder: Path, *, recursiv
 class AppWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("タグエディタ君 v1.2.0")
+        self.setWindowTitle("タグエディタ君 v1.3.0")
         self.resize(1440, 900)
 
         self.folder: Path | None = None
@@ -242,6 +243,13 @@ class AppWindow(QMainWindow):
         self.tag_panel = TagPanel()
         self.tagger_panel = TaggerPanel()
         self.tagger_session = TaggerSession()
+        self.tagger_exclusions_load_result = load_exclusions()
+        self.tagger_exclusion_rules = self.tagger_exclusions_load_result.rule_set
+        for issue in self.tagger_exclusions_load_result.issues:
+            log.warning("Tagger exclusion settings: %s", issue)
+        self.tagger_panel.exclusion_rules_changed.connect(self._on_tagger_exclusion_rules_changed)
+        self.tagger_panel.set_exclusion_context(
+            self.tagger_exclusion_rules, self.tagger_exclusions_load_result.issues)
         # Taggerタブ用の現在画像。タグ編集タブの current_index とは分離する。
         self._tagger_current_index: int = -1
         # Tagger専用の常駐子プロセス。CUDA・モデルは子プロセスだけが所有する。
@@ -947,12 +955,18 @@ class AppWindow(QMainWindow):
     def _apply_app_settings(self, *, apply_recursive: bool = False) -> None:
         """読み込み済みの環境設定を各UI部品へ反映する。"""
         self.thumbnail_panel.set_wheel_scroll_px(self.app_settings.thumbnail_wheel_scroll_px)
+        self.tag_panel.set_tag_preset_compact_enabled(self.app_settings.tag_preset_compact_enabled)
         self.tag_panel.set_tag_color_enabled(self.app_settings.tag_color_enabled)
         self.tag_panel.set_tag_completion_settings(
             enabled=self.app_settings.tag_completion_enabled,
             limit=self.app_settings.tag_completion_limit,
         )
         self.tagger_panel.set_tag_color_enabled(self.app_settings.tag_color_enabled)
+        self.tagger_panel.set_tag_completion_settings(
+            tag_dictionary=self.tag_panel._danbooru_tag_dictionary,
+            enabled=self.app_settings.tag_completion_enabled,
+            limit=self.app_settings.tag_completion_limit,
+        )
         self.tagger_panel.restore_persisted_settings(
             model_repo=self.app_settings.tagger_model_repo,
             device=self.app_settings.tagger_device,
@@ -963,6 +977,10 @@ class AppWindow(QMainWindow):
             include_copyright=self.app_settings.tagger_include_copyright,
             copyright_expanded=self.app_settings.tagger_copyright_expanded,
             apply_mode=self.app_settings.tagger_apply_mode,
+            exclusion_panel_open=self.app_settings.tagger_exclusion_panel_open,
+            exclusion_panel_width=self.app_settings.tagger_exclusion_panel_width,
+            exclusion_sort_mode=self.app_settings.tagger_exclusion_sort_mode,
+            model_profiles=self.app_settings.tagger_model_profiles,
         )
 
         if apply_recursive:
@@ -984,6 +1002,7 @@ class AppWindow(QMainWindow):
         settings_data.update(
             {
                 "tagger_model_repo": tagger_settings.get("model_repo"),
+                "tagger_model_profiles": tagger_settings.get("model_profiles", self.app_settings.tagger_model_profiles),
                 "tagger_device": tagger_settings.get("device"),
                 "tagger_include_general": tagger_settings.get("include_general"),
                 "tagger_general_threshold": tagger_settings.get("general_threshold"),
@@ -992,6 +1011,9 @@ class AppWindow(QMainWindow):
                 "tagger_include_copyright": tagger_settings.get("include_copyright"),
                 "tagger_copyright_expanded": tagger_settings.get("copyright_expanded"),
                 "tagger_apply_mode": tagger_settings.get("apply_mode"),
+                "tagger_exclusion_panel_open": tagger_settings.get("exclusion_panel_open"),
+                "tagger_exclusion_panel_width": tagger_settings.get("exclusion_panel_width"),
+                "tagger_exclusion_sort_mode": tagger_settings.get("exclusion_sort_mode"),
             }
         )
         self.app_settings = AppSettings.from_dict(settings_data)
@@ -1000,6 +1022,9 @@ class AppWindow(QMainWindow):
         except OSError as error:
             # スピンボックスの操作ごとにモーダルを出さず、UIはそのまま維持する。
             log.warning("failed to save Tagger settings: %s", error)
+
+    def _on_tagger_exclusion_rules_changed(self, rules) -> None:
+        self.tagger_exclusion_rules = rules
 
     def _save_recursive_load_settings_if_needed(self, enabled: bool, depth: int) -> None:
         """記憶設定がONの場合だけ、サムネイル欄の読み込み範囲設定を保存する。"""
@@ -1625,6 +1650,7 @@ class AppWindow(QMainWindow):
         known_names = {
             "SmilingWolf/wd-eva02-large-tagger-v3": "WD EVA02 Large Tagger v3",
             "pixai-labs/pixai-tagger-v0.9": "PixAI Tagger v0.9",
+            "pixai-labs/pixai-tagger-v1.0": "PixAI Tagger v1.0",
         }
         return known_names.get(model_repo, model_repo or "選択中のモデル")
 
@@ -1962,6 +1988,9 @@ class AppWindow(QMainWindow):
             general_candidates=decode_candidates("general_candidates", "general"),
             character_candidates=decode_candidates("character_candidates", "character"),
             copyright_candidates=decode_candidates("copyright_candidates", "copyright"),
+            style_candidates=decode_candidates("style_candidates", "style"),
+            meta_candidates=decode_candidates("meta_candidates", "meta"),
+            rating_candidates=decode_candidates("rating_candidates", "rating"),
         )
 
     def _on_tagger_process_failed(self, message: str) -> None:
@@ -2151,9 +2180,13 @@ class AppWindow(QMainWindow):
             return
 
         candidate_entries: list[tuple[ImageItem, list[str]]] = []
+        skipped_excluded_count = 0
+        no_result_count = 0
         for item in self.items:
             result = self.tagger_session.result_for_path(item.image_path)
             if result is None:
+                if item.image_path in self.tagger_session.no_result_paths:
+                    no_result_count += 1
                 continue
 
             tags = self._unique_tagger_output_tags(
@@ -2162,14 +2195,30 @@ class AppWindow(QMainWindow):
                     include_copyright=True,
                 )
             )
-            if tags:
-                candidate_entries.append((item, tags))
+            if not tags:
+                no_result_count += 1
+                continue
+            # 元の候補は保持し、表示と共用する最終判定で新規反映分だけを絞る。
+            tags = [
+                tag for tag in tags
+                if not evaluate_exclusion(tag, self.tagger_exclusion_rules).excluded
+            ]
+            if not tags:
+                skipped_excluded_count += 1
+                continue
+            candidate_entries.append((item, tags))
+
+        skip_lines: list[str] = []
+        if skipped_excluded_count:
+            skip_lines.append(f"除外により候補0件のためスキップ: {skipped_excluded_count}件")
+        if no_result_count:
+            skip_lines.append(f"最初から候補なし: {no_result_count}件")
 
         if not candidate_entries:
             QMessageBox.information(
                 self,
                 "Tagger反映",
-                "今回のTagger実行結果に、反映できる候補タグはありません。",
+                "\n".join(["今回のTagger実行結果に、反映できる候補タグはありません。", *skip_lines]),
             )
             return
 
@@ -2210,6 +2259,7 @@ class AppWindow(QMainWindow):
             informative_lines = [
                 "反映対象に、変更が必要な画像はありません。",
                 f"候補あり: {len(candidate_entries)}件",
+                *skip_lines,
             ]
             if skipped_existing_count:
                 informative_lines.append(
@@ -2232,6 +2282,8 @@ class AppWindow(QMainWindow):
             changed_entries=changed_entries,
             skipped_existing_count=skipped_existing_count,
             unchanged_count=unchanged_count,
+            skipped_excluded_count=skipped_excluded_count,
+            no_result_count=no_result_count,
         ):
             return
 
@@ -2253,10 +2305,12 @@ class AppWindow(QMainWindow):
         self._on_tags_changed()
         self._update_preview_placeholder_state()
 
-        self.tagger_panel.set_status_text(
-            f"Tagger候補を反映しました: {len(changed_entries)}件（未保存）"
-        )
-        log_user_ok("Tagger候補を反映しました: %d件（未保存）", len(changed_entries))
+        status_text = " / ".join([
+            f"Tagger候補を反映しました: {len(changed_entries)}件（未保存）",
+            *skip_lines,
+        ])
+        self.tagger_panel.set_status_text(status_text)
+        log_user_ok("%s", status_text)
 
     @staticmethod
     def _unique_tagger_output_tags(tags: list[str]) -> list[str]:
@@ -2283,6 +2337,8 @@ class AppWindow(QMainWindow):
         changed_entries: list[tuple[ImageItem, list[str]]],
         skipped_existing_count: int,
         unchanged_count: int,
+        skipped_excluded_count: int = 0,
+        no_result_count: int = 0,
     ) -> bool:
         """Tagger候補の一括反映前に、対象件数と未保存扱いを確認する。"""
         visible_limit = 10
@@ -2299,6 +2355,10 @@ class AppWindow(QMainWindow):
             f"候補あり: {candidate_count}件",
             f"反映される画像: {len(changed_entries)}件",
         ]
+        if skipped_excluded_count:
+            lines.append(f"除外により候補0件のためスキップ: {skipped_excluded_count}件")
+        if no_result_count:
+            lines.append(f"最初から候補なし: {no_result_count}件")
         if skipped_existing_count:
             lines.append(
                 f"既存タグありのため対象外: {skipped_existing_count}件"

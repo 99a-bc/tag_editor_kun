@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+from tag_context_menu import show_tag_lookup_menu
+
 from collections import Counter
 from pathlib import Path
 from typing import Callable
 import time
-from urllib.parse import quote_plus
 
 from logger import get_logger
 from dev_config import dev_log_enabled
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QDrag
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRect, QSize, Qt, QTimer, Signal
+from tag_drag_visual import drag_visual
+from shiboken6 import isValid
+from PySide6.QtGui import QColor, QDrag
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -50,7 +53,6 @@ from theme import (
     CHIP_SCROLL_QSS,
     GREEN,
     RED,
-    TAG_CHIP_DRAGGING_QSS,
     TAG_CHIP_QSS,
     TAG_CHIP_SEARCH_CURRENT_QSS,
     TAG_CHIP_SEARCH_HIGHLIGHT_QSS,
@@ -71,7 +73,6 @@ from tag_completion import TagCompletionController
 from settings import (
     DEFAULT_TAG_COMPLETION_ENABLED,
     DEFAULT_TAG_COMPLETION_LIMIT,
-    load_app_settings,
     normalize_tag_completion_limit,
 )
 from tag_presets import (
@@ -198,8 +199,9 @@ class SearchHighlightButton(QPushButton):
     検索一致部分の文字背景だけを自前描画で反転表示する。
     """
 
-    def __init__(self, display_text: str) -> None:
+    def __init__(self, display_text: str, *, full_text: str | None = None) -> None:
         super().__init__(display_text)
+        self._full_search_text = full_text if full_text is not None else display_text
         self._display_text = display_text
         self._search_query_text = ""
         self._search_current = False
@@ -239,6 +241,29 @@ class SearchHighlightButton(QPushButton):
         self.update()
         return True
 
+    def search_display_text(self, width: int) -> str:
+        """描画専用の省略。ボタンのtext/sizeHintと正式タグは変更しない。"""
+        full = self._full_search_text
+        span = _search_highlight_span(full, self._search_query_text)
+        if span is None:
+            return self._display_text
+        metrics = self.fontMetrics()
+        if metrics.horizontalAdvance(full) <= width:
+            return full
+        start, end = span
+        def excerpt(left, right):
+            return ("…" if left else "") + full[left:right] + ("…" if right < len(full) else "")
+        # 一致を中心に、収まる範囲だけ前後の文脈を足す。
+        if metrics.horizontalAdvance(excerpt(start, end)) > width:
+            return metrics.elidedText(full[start:end], Qt.TextElideMode.ElideRight, max(0, width))
+        while True:
+            if start > 0 and metrics.horizontalAdvance(excerpt(start - 1, end)) <= width:
+                start -= 1
+            elif end < len(full) and metrics.horizontalAdvance(excerpt(start, end + 1)) <= width:
+                end += 1
+            else:
+                return excerpt(start, end)
+
     def paintEvent(self, event) -> None:  # noqa: N802
         """
         通常時はQt標準のQPushButton描画へ任せる。
@@ -248,7 +273,10 @@ class SearchHighlightButton(QPushButton):
         「余白が不揃い」に見える原因になる。検索一致がある時だけ、背景ハイライトを
         重ねるために文字描画を自前で行う。
         """
-        text = self._display_text
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, self)
+        text = self.search_display_text(max(0, rect.width()))
         if not text:
             super().paintEvent(event)
             return
@@ -257,6 +285,8 @@ class SearchHighlightButton(QPushButton):
             span = (0, len(text))
         else:
             span = _search_highlight_span(text, self._search_query_text)
+            if span is None and self._search_query_text and _search_highlight_span(self._full_search_text, self._search_query_text):
+                span = (0, len(text))
 
         if span is None:
             super().paintEvent(event)
@@ -381,7 +411,7 @@ class TagChip(QFrame):
 
         display_tag = shorten_text(tag, 44)
 
-        self.tag_button = SearchHighlightButton(display_tag)
+        self.tag_button = SearchHighlightButton(display_tag, full_text=tag)
         self.tag_button.setToolTip(tag)
         self.tag_button.setCheckable(True)
         self.tag_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -573,13 +603,17 @@ class TagChip(QFrame):
 
         drag = QDrag(self)
         drag.setMimeData(mime_data)
-        drag.setHotSpot(QPoint(self.width() // 2, self.height() // 2))
-
         previous_checked = self.tag_button.isChecked()
-        self.tag_button.setStyleSheet(TAG_CHIP_DRAGGING_QSS)
-        drag.exec(Qt.DropAction.MoveAction)
-        self.tag_button.setChecked(previous_checked)
-        self.tag_button.setStyleSheet(self._normal_qss)
+        hotspot = self._drag_start_pos if self._drag_start_pos is not None else QPoint(0, 0)
+        try:
+            with drag_visual(drag, self.tag_button, hotspot):
+                drag.exec(Qt.DropAction.MoveAction)
+        finally:
+            if isValid(self.tag_button):
+                self.tag_button.setChecked(previous_checked)
+                self.tag_button.setDown(False)
+            if isValid(drag):
+                drag.deleteLater()
 
     def update_badge_text(self, badge_text: str | None) -> bool:
         """
@@ -767,7 +801,7 @@ class AllTagChip(QFrame):
         # チップ全体の利用可能幅で必要な場合だけ省略する。
         display_tag = tag
 
-        self.tag_button = SearchHighlightButton(display_tag)
+        self.tag_button = SearchHighlightButton(display_tag, full_text=tag)
         self.tag_button.setCheckable(True)
         self.tag_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.tag_button.setToolTip(f"{tag}\n使用数: {count}")
@@ -1832,7 +1866,7 @@ class PresetCheckTagWidget(QFrame):
         self.checkbox.toggled.connect(self._sync_check_mark)
         self._sync_check_mark(self.checkbox.isChecked())
 
-        self.tag_button = SearchHighlightButton(shorten_text(tag, 44))
+        self.tag_button = SearchHighlightButton(shorten_text(tag, 44), full_text=tag)
         self.tag_button.setObjectName("PresetTagToggleButton")
         self.tag_button.setToolTip(tag)
         self.tag_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -5863,56 +5897,8 @@ class TagPanel(QFrame):
         if self._all_tag_search_match_tags:
             self._schedule_scroll_to_current_all_tag_match()
 
-    def _booru_query_tag(self, tag: str) -> str:
-        """
-        Danbooru / Gelbooru 用にタグ検索文字列を正規化する。
-
-        caption内では "closed eyes" のように空白区切りで入っている場合があるが、
-        booru系のタグ検索では "closed_eyes" のように underscore 区切りが必要になる。
-        既に underscore が入っているタグはそのまま維持する。
-        """
-        return "_".join(tag.strip().split())
-
     def _show_tag_context_menu(self, tag: str, global_pos: QPoint) -> None:
-        """タグチップ共通の右クリックメニューを表示する。"""
-        menu = QMenu(self)
-
-        copy_action = menu.addAction("コピー")
-        google_action = menu.addAction("Googleで検索")
-        danbooru_action = menu.addAction("Danbooruで検索")
-        danbooru_wiki_action = menu.addAction("Danbooru Wikiを開く")
-        gelbooru_action = menu.addAction("Gelbooruで検索")
-        gelbooru_wiki_action = menu.addAction("Gelbooru Wikiで検索")
-
-        selected_action = menu.exec(global_pos)
-        if selected_action == copy_action:
-            QApplication.clipboard().setText(tag)
-            return
-
-        if selected_action == google_action:
-            query = quote_plus(tag)
-            QDesktopServices.openUrl(QUrl(f"https://www.google.com/search?q={query}"))
-            return
-
-        if selected_action == danbooru_action:
-            query = quote_plus(self._booru_query_tag(tag))
-            QDesktopServices.openUrl(QUrl(f"https://danbooru.donmai.us/posts?tags={query}"))
-            return
-
-        if selected_action == danbooru_wiki_action:
-            query = quote_plus(self._booru_query_tag(tag))
-            QDesktopServices.openUrl(QUrl(f"https://danbooru.donmai.us/wiki_pages/{query}"))
-            return
-
-        if selected_action == gelbooru_action:
-            query = quote_plus(self._booru_query_tag(tag))
-            QDesktopServices.openUrl(QUrl(f"https://gelbooru.com/index.php?page=post&s=list&tags={query}"))
-            return
-
-        if selected_action == gelbooru_wiki_action:
-            query = quote_plus(self._booru_query_tag(tag))
-            QDesktopServices.openUrl(QUrl(f"https://gelbooru.com/index.php?page=wiki&s=list&search={query}"))
-            return
+        show_tag_lookup_menu(self, tag, global_pos)
 
     def _connect_tag_context_menu(self, chip: QWidget) -> None:
         """context_menu_requested を持つタグチップを共通メニューへ接続する。"""
@@ -5923,12 +5909,6 @@ class TagPanel(QFrame):
         """新規に開く追加・置換ダイアログへDanbooru候補設定を渡す。"""
         self._tag_completion_enabled = bool(enabled)
         self._tag_completion_limit = normalize_tag_completion_limit(limit)
-
-        # AppWindowの既存 _apply_app_settings() はこのメソッドを起動時と環境設定OK後に
-        # 必ず呼ぶ。プリセット表示設定も同じ settings.json にあるため、ここで同期して
-        # 既存AppWindowを変更せず即時反映できるようにする。
-        app_settings = load_app_settings()
-        self.set_tag_preset_compact_enabled(app_settings.tag_preset_compact_enabled)
 
     def set_tag_preset_compact_enabled(self, enabled: bool) -> None:
         """プリセットタグを1行表示 / 折り返し詰め表示へ切り替える。"""

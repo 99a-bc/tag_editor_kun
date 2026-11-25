@@ -18,7 +18,6 @@
 *.webp binary
 *.gif binary
 *.ico binary
-*.onnx binary
 *.safetensors binary
 *.gguf binary
 *.zip binary

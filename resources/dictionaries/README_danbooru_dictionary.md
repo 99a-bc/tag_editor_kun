@@ -1,14 +1,12 @@
 # Danbooru補完辞書の配置
 
-TagComplete互換のCSVを、次の名前で配置してください。
+このリポジトリには、タグ入力補完に使うTagComplete互換のCSVを次の場所に同梱しています。
 
 ```text
 resources/dictionaries/danbooru.csv
 ```
 
-このリポジトリにはCSV本体を含めません。開発時は
-`DominikDoom/a1111-sd-webui-tagcomplete` の `tags/danbooru.csv` を取得して、
-上記の場所へコピーしてください。
+取得元は `DominikDoom/a1111-sd-webui-tagcomplete` の `tags/danbooru.csv` です。出典とライセンスは [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) に記載しています。
 
 ## このアプリでの扱い
 
@@ -20,5 +18,4 @@ resources/dictionaries/danbooru.csv
 
 ## 配布時の注意
 
-CSVを同梱して配布する場合は、取得元・取得した版・必要なライセンス表記を
-READMEや同梱ライセンス文書へ記載してください。
+CSVを差し替えて配布する場合は、取得元・取得した版・必要なライセンス表記を同梱の第三者ライセンス文書に記載してください。

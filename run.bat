@@ -21,6 +21,5 @@ if not "%EXIT_CODE%"=="0" (
 
 :end
 popd
-endlocal
 pause
-exit /b %EXIT_CODE%
+endlocal & exit /b %EXIT_CODE%

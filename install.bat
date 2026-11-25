@@ -130,6 +130,8 @@ echo.
 echo [STEP] ìÆçÏämîF...
 python -c "import torch; print('torch', torch.__version__)"
 if errorlevel 1 goto check_err
+python -c "import transformers; print('transformers', transformers.__version__)"
+if errorlevel 1 goto check_err
 python -c "import torch; print('cuda_runtime', torch.version.cuda); print('cuda_available', torch.cuda.is_available())"
 if errorlevel 1 goto check_err
 python -c "import timm; print('timm ok')"

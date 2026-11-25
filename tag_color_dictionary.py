@@ -7,6 +7,7 @@ import re
 
 
 DEFAULT_UNKNOWN_CATEGORY = "unknown"
+NO_COLOR_CATEGORIES = frozenset({"general", DEFAULT_UNKNOWN_CATEGORY})
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 _TAG_KEY_WHITESPACE_RE = re.compile(r"\s+")
@@ -127,25 +128,17 @@ class TagColorDictionary:
                 {"label": "未分類", "color": "#2b2b2b"},
             )
 
-        # Python の dict は挿入順を保持する。
-        # tag_color_dictionary.json の categories 記述順を、
-        # 「色分け順」の並べ替え順として使う。
-        #
-        # unknown は並び順から一度除外してから連番を振る。
-        # enumerate(self._categories.keys()) しながら unknown だけ飛ばすと、
-        # unknown より後ろに書かれた最後のカテゴリが unknown と同じ
-        # ソート位置になることがあるため。
+        # 色付きカテゴリは辞書の記述順で連番を振り、色なしカテゴリは末尾にまとめる。
         ordered_category_ids = [
             category_id
-            for category_id in self._categories.keys()
-            if category_id != DEFAULT_UNKNOWN_CATEGORY
+            for category_id in self._categories
+            if category_id not in NO_COLOR_CATEGORIES
         ]
         self._category_sort_order: dict[str, int] = {
             category_id: index
             for index, category_id in enumerate(ordered_category_ids)
         }
-        # unknown は常に最後へ送る。
-        self._unknown_sort_index = len(ordered_category_ids)
+        self._no_color_sort_index = len(ordered_category_ids)
 
     @classmethod
     def empty(cls) -> "TagColorDictionary":
@@ -209,18 +202,15 @@ class TagColorDictionary:
     def category_sort_index_for_tag(self, tag: str) -> int:
         """タグの色分けカテゴリ順インデックスを返す。
 
-        JSON の categories に書かれている順を表示順として使う。
-        辞書にないタグ、または存在しないカテゴリを指しているタグは最後に並べる。
+        色付きカテゴリは JSON の記述順を使い、色なしカテゴリは共通の末尾順位を使う。
         """
         category_id = self.category_id_for_tag(tag)
-        if category_id == DEFAULT_UNKNOWN_CATEGORY:
-            return self._unknown_sort_index
-        return self._category_sort_order.get(category_id, self._unknown_sort_index)
+        return self._category_sort_order.get(category_id, self._no_color_sort_index)
 
     def sort_key_for_tag(self, tag: str) -> tuple[int, str]:
         """色分け順ソート用キー。
 
-        同じカテゴリ内では、画面上のタグ名を大文字小文字無視で名前順にする。
+        同じ順位内では、画面上のタグ名を大文字小文字無視で名前順にする。
         """
         return (self.category_sort_index_for_tag(tag), tag.casefold())
 
@@ -232,7 +222,7 @@ class TagColorDictionary:
 
 
 def tag_chip_qss(style: TagCategoryStyle) -> str | None:
-    if style.category_id == DEFAULT_UNKNOWN_CATEGORY:
+    if style.category_id in NO_COLOR_CATEGORIES:
         return None
 
     selected_border_color = _selected_dash_color(style.border_color)
@@ -278,7 +268,7 @@ def all_tag_chip_qss(style: TagCategoryStyle) -> str | None:
 
 
 def all_tag_button_qss(style: TagCategoryStyle) -> str | None:
-    if style.category_id == DEFAULT_UNKNOWN_CATEGORY:
+    if style.category_id in NO_COLOR_CATEGORIES:
         return None
 
     selected_border_color = _selected_dash_color(style.border_color)

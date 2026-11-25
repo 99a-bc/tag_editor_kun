@@ -18,6 +18,8 @@ import sys
 import traceback
 
 
+from tagger.pixai_v1_backend import MODEL_REPO as PIXAI_V1_REPO, CATEGORY_ORDER, CategorySettings
+
 PROTOCOL_VERSION = 1
 DEFAULT_MODEL_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
 PIXAI_MODEL_REPO = "pixai-labs/pixai-tagger-v0.9"
@@ -54,10 +56,14 @@ def normalize_model_repo(value: object) -> str:
 
 
 def resolve_backend_kind(model_repo: str) -> str:
-    # モデルIDからbackend種別を決める。未知のIDは従来どおりWDとして扱う。
+    # 未対応のモデルIDを既存バックエンドの取得元として扱わない。
+    if model_repo.casefold() == PIXAI_V1_REPO.casefold():
+        return "pixai_v1"
     if model_repo.casefold() == PIXAI_MODEL_REPO.casefold():
         return "pixai"
-    return "wd"
+    if model_repo.casefold() == DEFAULT_MODEL_REPO.casefold():
+        return "wd"
+    raise ValueError(f"未対応のTaggerモデルです: {model_repo}")
 
 
 def resolve_effective_device_name(requested_device: object) -> str:
@@ -90,9 +96,10 @@ def serialize_candidates(candidates) -> list[dict[str, object]]:
 
 def serialize_result(result) -> dict[str, object]:
     return {
-        "general_candidates": serialize_candidates(result.general_candidates),
-        "character_candidates": serialize_candidates(result.character_candidates),
-        "copyright_candidates": serialize_candidates(result.copyright_candidates),
+        f"{name}_candidates": serialize_candidates(
+            result.candidates_by_category[name] if hasattr(result, "candidates_by_category")
+            else getattr(result, f"{name}_candidates", []))
+        for name in CATEGORY_ORDER
     }
 
 
@@ -101,6 +108,10 @@ def release_backend(backend) -> None:
     if backend is None:
         return
 
+    if hasattr(backend, "close"):
+        backend.close()
+        gc.collect()
+        return
     device_name = getattr(backend, "device_name", "")
     try:
         backend.model = None
@@ -144,7 +155,7 @@ def parse_batch_paths(value: object) -> list[Path]:
 
 def ensure_backend(
     backend,
-    runtime_key: tuple[str, str, str] | None,
+    runtime_key: tuple[str, ...] | None,
     settings: dict[str, object],
 ):
     """指定設定に合うbackendを返す。必要な時だけ旧モデルを破棄して載せ替える。"""
@@ -163,7 +174,13 @@ def ensure_backend(
     runtime_key = None
 
     try:
-        if backend_kind == "pixai":
+        if backend_kind == "pixai_v1":
+            from tagger.pixai_v1_backend import PixAIV1TaggerBackend
+
+            # 再利用キーとロード先を同じ実効デバイスにそろえる。
+            device = "gpu" if effective_device == "cuda" else "cpu"
+            backend = PixAIV1TaggerBackend(device=device, allow_download=True)
+        elif backend_kind == "pixai":
             from tagger.pixai_backend import PixAITaggerBackend
 
             backend = PixAITaggerBackend(model_repo, requested_device)
@@ -173,7 +190,7 @@ def ensure_backend(
             backend = WDTaggerBackend(model_repo, requested_device)
 
         backend.load()
-        runtime_key = (backend_kind, backend.model_repo, backend.device_name)
+        runtime_key = requested_key
     except Exception:
         release_backend(backend)
         raise
@@ -187,7 +204,7 @@ def run_predict_batch(
     paths: list[Path],
     settings: dict[str, object],
     backend,
-    runtime_key: tuple[str, str, str] | None,
+    runtime_key: tuple[str, ...] | None,
 ):
     """1つのバッチ要求を順番に処理し、画像ごとの結果と進捗を返す。"""
     backend, runtime_key, backend_reused = ensure_backend(
@@ -222,14 +239,20 @@ def run_predict_batch(
             if not image_path.is_file():
                 raise RuntimeError(f"画像ファイルが見つかりません。\n{image_path}")
 
-            result = backend.predict_image(
-                image_path,
-                include_general=include_general,
-                general_threshold=general_threshold,
-                include_character=include_character,
-                character_threshold=character_threshold,
-                include_copyright=include_copyright,
-            )
+            if resolve_backend_kind(backend.model_repo) == "pixai_v1":
+                raw_categories = settings.get("categories", {})
+                categories = {name: CategorySettings(value["enabled"], value["threshold"])
+                              for name, value in raw_categories.items()}
+                result = backend.predict_image(image_path, categories=categories)
+            else:
+                result = backend.predict_image(
+                    image_path,
+                    include_general=include_general,
+                    general_threshold=general_threshold,
+                    include_character=include_character,
+                    character_threshold=character_threshold,
+                    include_copyright=include_copyright,
+                )
             candidate_count = len(result.all_candidates)
             if candidate_count:
                 generated_count += 1
@@ -289,7 +312,7 @@ def run_predict_batch(
 
 def main() -> int:
     backend = None
-    runtime_key: tuple[str, str, str] | None = None
+    runtime_key: tuple[str, ...] | None = None
 
     emit(
         {

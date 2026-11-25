@@ -16,3 +16,7 @@ config.json
 
 config/settings.json
 config/tag_presets.json
+config/tagger_exclusions.json
+
+# Downloaded model assets and runtime validation output
+models/

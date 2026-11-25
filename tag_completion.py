@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from danbooru_tag_dictionary import DanbooruTagDictionary, TagCompletionCandidate
-from tag_color_dictionary import DEFAULT_UNKNOWN_CATEGORY, TagColorDictionary
+from tag_color_dictionary import NO_COLOR_CATEGORIES, TagColorDictionary
 
 
 def format_post_count(post_count: int) -> str:
@@ -81,7 +81,7 @@ class _CompletionRow(QWidget):
         tag_text_color = "#edf6ff"
         if (
             category_style is not None
-            and category_style.category_id != DEFAULT_UNKNOWN_CATEGORY
+            and category_style.category_id not in NO_COLOR_CATEGORIES
         ):
             tag_text_color = category_style.border_color
 
@@ -144,7 +144,7 @@ class _CompletionRow(QWidget):
         )
         self.setMinimumWidth(self._natural_width)
 
-        if category_style is not None and category_style.category_id != DEFAULT_UNKNOWN_CATEGORY:
+        if category_style is not None and category_style.category_id not in NO_COLOR_CATEGORIES:
             self.setStyleSheet(
                 f"""
                 _CompletionRow {{
