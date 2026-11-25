@@ -6325,7 +6325,7 @@ class TagPanel(QFrame):
             self.target_label.setProperty("targetTextColor", target_color)
             self.target_label.setStyleSheet(
                 f"QLabel {{ color: {target_color}; padding: 3px 6px; "
-                "font-weight: 700; }}"
+                "font-weight: 700; }"
             )
 
         # プリセットパネルには操作対象を重複表示しない。
